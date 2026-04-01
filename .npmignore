@@ -1,0 +1,9 @@
+.github/
+website/
+jaku-reports/
+screenshots/
+jaku.config.json
+latest-report.json
+*.log
+.DS_Store
+*.docx
