@@ -1,4 +1,4 @@
-import { BrowserManager } from './browser-manager.js';
+import { chromium } from 'playwright';
 import fs from 'fs';
 import path from 'path';
 import readline from 'readline';
@@ -21,6 +21,7 @@ export class AuthManager {
         this.logger = logger;
         this.authStates = new Map();  // role → { state, postLoginUrl, discoveredLinks }
         this.authTokens = new Map();  // role → { token, type }
+        this.loginFormInfo = null;    // { type, triggerSelector, isModal, url }
         this._browser = null;
     }
 
@@ -37,15 +38,34 @@ export class AuthManager {
         if (credentials.filter(c => c.username && c.password).length === 0) {
             const loginUrl = this.config.auth?.login_url || await this._discoverLoginPage();
             if (loginUrl) {
-                const prompted = await this._promptForCredentials(loginUrl);
-                if (!prompted) {
-                    this.logger?.info?.('No credentials provided — scanning unauthenticated');
+                const formType = this.loginFormInfo?.type || 'password';
+
+                // Only prompt for credentials on password-based logins
+                // OTP/social/phone logins can't be automated via simple credentials
+                if (formType === 'password' || formType === 'email') {
+                    const prompted = await this._promptForCredentials(loginUrl);
+                    if (!prompted) {
+                        this.logger?.info?.('No credentials provided — scanning unauthenticated');
+                        return this.authStates;
+                    }
+                    this.logger?.info?.(`Auth complete: ${this.authStates.size} role(s) authenticated`);
+                    return this.authStates;
+                } else if (formType === 'phone' || formType === 'otp') {
+                    // Phone/OTP — prompt for phone number and OTP interactively
+                    const otpResult = await this._promptForOTPLogin(loginUrl);
+                    if (!otpResult) {
+                        this.logger?.info?.('No phone credentials provided — scanning unauthenticated');
+                        return this.authStates;
+                    }
+                    this.logger?.info?.(`Auth complete: ${this.authStates.size} role(s) authenticated via OTP`);
+                    return this.authStates;
+                } else {
+                    // Social login — can't automate, scan unauthenticated
+                    const detail = this.loginFormInfo?.details || formType;
+                    this.logger?.info?.(`Login form detected (${formType}: ${detail}) — cannot auto-authenticate, scanning unauthenticated`);
+                    this.logger?.info?.('Tip: Use --login-url and --auth-strategy cookie to provide pre-authenticated session cookies');
                     return this.authStates;
                 }
-                // _promptForCredentials already verified + stored the auth state
-                // so we can return directly
-                this.logger?.info?.(`Auth complete: ${this.authStates.size} role(s) authenticated`);
-                return this.authStates;
             } else {
                 this.logger?.info?.('No login form detected — scanning unauthenticated');
                 return this.authStates;
@@ -54,7 +74,7 @@ export class AuthManager {
 
         // CLI flags or config provided credentials — authenticate them
         const authConfig = this.config.auth || {};
-        this._browser = await BrowserManager.launch({ headless: true });
+        this._browser = await chromium.launch({ headless: true });
 
         for (const cred of credentials) {
             if (!cred.username || !cred.password) {
@@ -310,8 +330,80 @@ export class AuthManager {
     // ═══ Helper Methods ═══
 
     /**
-     * Discover login page by probing common login URLs.
+     * Detect auth-related form elements on the current page.
+     * Returns { found: boolean, type: 'password'|'otp'|'phone'|'social'|'email', details: string }
+     */
+    async _detectAuthForm(page) {
+        return page.evaluate(() => {
+            // — Priority 1: Traditional password field
+            if (document.querySelector('input[type="password"]')) {
+                return { found: true, type: 'password', details: 'Password input field detected' };
+            }
+
+            // — Priority 2: Phone / mobile number input (OTP-based auth)
+            const phoneSelectors = [
+                'input[type="tel"]',
+                'input[name*="phone"]', 'input[name*="mobile"]',
+                'input[id*="phone"]', 'input[id*="mobile"]',
+                'input[placeholder*="phone" i]', 'input[placeholder*="mobile" i]',
+                'input[autocomplete="tel"]',
+            ];
+            for (const sel of phoneSelectors) {
+                const el = document.querySelector(sel);
+                if (el && el.offsetParent !== null) {
+                    return { found: true, type: 'phone', details: `Phone input detected: ${sel}` };
+                }
+            }
+
+            // — Priority 3: OTP input fields
+            const otpSelectors = [
+                'input[name*="otp"]', 'input[id*="otp"]',
+                'input[autocomplete="one-time-code"]',
+                'input[placeholder*="OTP" i]', 'input[placeholder*="verification code" i]',
+            ];
+            for (const sel of otpSelectors) {
+                const el = document.querySelector(sel);
+                if (el && el.offsetParent !== null) {
+                    return { found: true, type: 'otp', details: `OTP input detected: ${sel}` };
+                }
+            }
+
+            // — Priority 4: Social / OAuth login buttons
+            const allButtons = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+            const socialPatterns = /sign\s*in\s*with\s*(google|facebook|apple|github|microsoft|twitter)|continue\s*with\s*(google|facebook|apple|github)|log\s*in\s*with\s*(google|facebook|apple|github)/i;
+            for (const btn of allButtons) {
+                const text = btn.textContent?.trim() || '';
+                const ariaLabel = btn.getAttribute('aria-label') || '';
+                if (socialPatterns.test(text) || socialPatterns.test(ariaLabel)) {
+                    return { found: true, type: 'social', details: `Social login button: "${text.substring(0, 60)}"` };
+                }
+            }
+
+            // — Priority 5: Google sign-in iframe or div
+            const gsiFrame = document.querySelector('iframe[src*="accounts.google.com"], div.g_id_signin, #g_id_onload');
+            if (gsiFrame) {
+                return { found: true, type: 'social', details: 'Google Sign-In widget detected' };
+            }
+
+            // — Priority 6: Email-only login (passwordless / magic link)
+            const emailField = document.querySelector('input[type="email"], input[name="email"], input[autocomplete="email"]');
+            if (emailField && emailField.offsetParent !== null) {
+                // Only count as login if there's login-related context around it
+                const bodyText = document.body?.textContent?.toLowerCase() || '';
+                const hasLoginContext = /sign\s*in|log\s*in|authenticate|get\s*started|create.*account|register/i.test(bodyText);
+                if (hasLoginContext) {
+                    return { found: true, type: 'email', details: 'Email field with login context detected' };
+                }
+            }
+
+            return { found: false, type: null, details: null };
+        });
+    }
+
+    /**
+     * Discover login page by probing common login URLs and interactive elements.
      * Uses Playwright to render pages (SPAs render login forms via JS).
+     * Now also detects OTP, phone, social login, and modal-based auth flows.
      */
     async _discoverLoginPage() {
         const paths = ['/login', '/signin', '/auth/login', '/auth/signin', '/sign-in',
@@ -322,7 +414,7 @@ export class AuthManager {
         // Launch a browser to render pages (SPA login forms are JS-rendered)
         let browser;
         try {
-            browser = await BrowserManager.launch({ headless: true });
+            browser = await chromium.launch({ headless: true });
         } catch {
             // Fallback to fetch if browser can't launch
             return this._discoverLoginPageViaFetch();
@@ -334,6 +426,7 @@ export class AuthManager {
         });
 
         try {
+            // ── Phase 1: Probe common login URL paths ──
             for (const p of paths) {
                 try {
                     const url = new URL(p, baseUrl).href;
@@ -349,22 +442,18 @@ export class AuthManager {
                         continue;
                     }
 
-                    // Check the rendered DOM for password fields
-                    const hasLoginForm = await page.evaluate(() => {
-                        const passwordField = document.querySelector('input[type="password"]');
-                        if (passwordField) return true;
-
-                        // Check for login-related text in the page
-                        const bodyText = document.body?.textContent?.toLowerCase() || '';
-                        const hasLoginText = /sign\s*in|log\s*in|authenticate|enter.*password/i.test(bodyText);
-                        const hasEmailField = !!document.querySelector('input[type="email"], input[name="email"], input[name="username"]');
-                        return hasLoginText && hasEmailField;
-                    });
-
+                    const authForm = await this._detectAuthForm(page);
                     await page.close();
 
-                    if (hasLoginForm) {
-                        this.logger?.info?.(`Discovered login page: ${url}`);
+                    if (authForm.found) {
+                        this.loginFormInfo = {
+                            type: authForm.type,
+                            triggerSelector: null,
+                            isModal: false,
+                            url,
+                            details: authForm.details,
+                        };
+                        this.logger?.info?.(`Discovered login page: ${url} (${authForm.type}: ${authForm.details})`);
                         await context.close();
                         await browser.close();
                         return url;
@@ -374,38 +463,125 @@ export class AuthManager {
                 }
             }
 
-            // Also check the homepage itself — some SPAs have login right on the main page
+            // ── Phase 2: Check the homepage for inline login forms ──
+            let homePage;
             try {
-                const page = await context.newPage();
-                await page.goto(baseUrl, { waitUntil: 'networkidle', timeout: 10000 });
+                homePage = await context.newPage();
+                await homePage.goto(baseUrl, { waitUntil: 'networkidle', timeout: 10000 });
 
-                // Check if login form is directly on the homepage
-                const hasPasswordOnHome = await page.$('input[type="password"]');
-                if (hasPasswordOnHome) {
-                    this.logger?.info?.(`Discovered login form on homepage: ${baseUrl}`);
-                    await page.close();
+                const homeAuthForm = await this._detectAuthForm(homePage);
+                if (homeAuthForm.found) {
+                    this.loginFormInfo = {
+                        type: homeAuthForm.type,
+                        triggerSelector: null,
+                        isModal: false,
+                        url: baseUrl,
+                        details: homeAuthForm.details,
+                    };
+                    this.logger?.info?.(`Discovered login form on homepage: ${baseUrl} (${homeAuthForm.type})`);
+                    await homePage.close();
                     await context.close();
                     await browser.close();
                     return baseUrl;
                 }
+            } catch {
+                homePage = null;
+            }
 
-                // Check for login links that might lead to a login form
-                const loginLink = await page.$('a:has-text("Log in"), a:has-text("Sign in"), a:has-text("Login"), a:has-text("Sign In")');
-                if (loginLink) {
-                    await loginLink.click();
-                    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => { });
-                    const loginUrl = page.url();
-                    const hasPasswordNow = await page.$('input[type="password"]');
-                    await page.close();
-                    if (hasPasswordNow) {
-                        this.logger?.info?.(`Discovered login page via navigation: ${loginUrl}`);
-                        await context.close();
-                        await browser.close();
-                        return loginUrl;
+            // ── Phase 3: Click login trigger buttons/links to discover modals ──
+            if (homePage) {
+                const loginTriggerSelectors = [
+                    // Text-based (Playwright :has-text)
+                    'a:has-text("Login")', 'a:has-text("Log in")', 'a:has-text("Sign in")',
+                    'a:has-text("Sign In")', 'a:has-text("Log In")',
+                    'button:has-text("Login")', 'button:has-text("Log in")',
+                    'button:has-text("Sign in")', 'button:has-text("Sign In")',
+                    'button:has-text("Log In")', 'button:has-text("Get Started")',
+                    'button:has-text("My Account")', 'a:has-text("My Account")',
+                    // Attribute-based
+                    '[data-testid*="login"]', '[data-testid*="signin"]',
+                    '[aria-label*="login" i]', '[aria-label*="sign in" i]',
+                    '[href*="login"]', '[href*="signin"]', '[href*="sign-in"]',
+                ];
+
+                for (const triggerSel of loginTriggerSelectors) {
+                    try {
+                        const trigger = await homePage.$(triggerSel);
+                        if (!trigger) continue;
+
+                        // Check if trigger is visible
+                        const isVisible = await trigger.isVisible().catch(() => false);
+                        if (!isVisible) continue;
+
+                        this.logger?.debug?.(`Clicking login trigger: ${triggerSel}`);
+
+                        // Snapshot URL before click
+                        const urlBefore = homePage.url();
+
+                        // Click and wait for either navigation or DOM change
+                        await Promise.all([
+                            homePage.waitForEvent('framenavigated', { timeout: 3000 })
+                                .catch(() => null),
+                            trigger.click(),
+                        ]);
+
+                        // Wait a moment for modals/SPAs to render
+                        await homePage.waitForTimeout(1500);
+
+                        // Check if a modal/dialog appeared
+                        const modalDetected = await homePage.evaluate(() => {
+                            const modalSelectors = [
+                                '[role="dialog"]', '[role="alertdialog"]',
+                                '.modal', '.Modal', '[class*="modal"]', '[class*="Modal"]',
+                                '[class*="dialog"]', '[class*="Dialog"]',
+                                '[class*="overlay"]', '[class*="Overlay"]',
+                                '[class*="popup"]', '[class*="Popup"]',
+                                '[class*="auth"]', '[class*="Auth"]',
+                                '[class*="login"]', '[class*="Login"]',
+                            ];
+                            for (const sel of modalSelectors) {
+                                const el = document.querySelector(sel);
+                                if (el && el.offsetParent !== null) return true;
+                            }
+                            return false;
+                        });
+
+                        const urlAfter = homePage.url();
+                        const navigated = urlAfter !== urlBefore;
+
+                        // Now check for auth forms in the current state
+                        const postClickAuth = await this._detectAuthForm(homePage);
+
+                        if (postClickAuth.found) {
+                            this.loginFormInfo = {
+                                type: postClickAuth.type,
+                                triggerSelector: triggerSel,
+                                isModal: modalDetected && !navigated,
+                                url: navigated ? urlAfter : baseUrl,
+                                details: postClickAuth.details,
+                            };
+                            const location = modalDetected ? 'modal' : (navigated ? `page ${urlAfter}` : 'homepage');
+                            this.logger?.info?.(`Discovered login form via button click → ${location} (${postClickAuth.type}: ${postClickAuth.details})`);
+                            await homePage.close();
+                            await context.close();
+                            await browser.close();
+                            return navigated ? urlAfter : baseUrl;
+                        }
+
+                        // If we navigated away, go back for next attempt
+                        if (navigated) {
+                            await homePage.goto(baseUrl, { waitUntil: 'networkidle', timeout: 10000 }).catch(() => { });
+                        } else if (modalDetected) {
+                            // Try to close the modal (press Escape) before next attempt
+                            await homePage.keyboard.press('Escape');
+                            await homePage.waitForTimeout(500);
+                        }
+                    } catch {
+                        // Skip this trigger
                     }
                 }
-                await page.close();
-            } catch { /* skip */ }
+                await homePage.close().catch(() => { });
+            }
         } finally {
             await context.close().catch(() => { });
             await browser.close().catch(() => { });
@@ -431,9 +607,16 @@ export class AuthManager {
                 });
                 if (resp.ok) {
                     const body = await resp.text();
-                    if (body.match(/type=["']password["']/i) ||
-                        body.match(/login|sign.?in|authenticate/i)) {
-                        this.logger?.debug?.(`Discovered login page via fetch: ${url}`);
+                    // Detect password, phone, OTP, or email login fields in HTML
+                    const hasPassword = /type=["']password["']/i.test(body);
+                    const hasPhone = /type=["']tel["']|name=["'][^"']*(?:phone|mobile)[^"']*["']/i.test(body);
+                    const hasOtp = /name=["'][^"']*otp[^"']*["']|autocomplete=["']one-time-code["']/i.test(body);
+                    const hasLoginContext = /login|sign.?in|authenticate/i.test(body);
+
+                    if (hasPassword || ((hasPhone || hasOtp) && hasLoginContext)) {
+                        const type = hasPassword ? 'password' : hasPhone ? 'phone' : 'otp';
+                        this.loginFormInfo = { type, triggerSelector: null, isModal: false, url, details: `Detected via fetch (${type})` };
+                        this.logger?.debug?.(`Discovered login page via fetch: ${url} (${type})`);
                         return url;
                     }
                 }
@@ -493,7 +676,7 @@ export class AuthManager {
             // Try to actually authenticate with these credentials
             console.log(chalk.dim('  Verifying credentials...'));
 
-            this._browser = this._browser || await BrowserManager.launch({ headless: true });
+            this._browser = this._browser || await (await import('playwright')).chromium.launch({ headless: true });
             const authConfig = this.config.auth || {};
             const state = await this._autoLogin(cred, { ...authConfig, login_url: loginUrl });
 
@@ -517,6 +700,342 @@ export class AuthManager {
         }
 
         return null;
+    }
+
+    /**
+     * Interactive OTP login flow via terminal.
+     * 1. Prompts for phone number
+     * 2. Opens browser, triggers login, fills phone, clicks "Request OTP"
+     * 3. Prompts for OTP
+     * 4. Fills OTP, verifies login, captures auth state
+     */
+    async _promptForOTPLogin(loginUrl) {
+        // Don't prompt in CI/CD or non-interactive environments
+        if (!process.stdin.isTTY) return null;
+
+        // Stop the spinner before prompting (hook set by CLI)
+        this._onBeforePrompt?.();
+
+        const chalk = await import('chalk').then(m => m.default).catch(() => ({
+            hex: () => s => s, dim: s => s, yellow: s => s, green: s => s, red: s => s, bold: s => s, cyan: s => s
+        }));
+
+        console.log();
+        console.log(chalk.yellow('  📱 Phone/OTP login detected at: ') + chalk.dim(loginUrl));
+        console.log(chalk.dim('     Enter your phone number for authenticated scanning, or press Enter to skip.'));
+        console.log();
+
+        const phoneNumber = await this._ask(chalk.dim('  Phone number (e.g. 9876543210): '));
+        if (!phoneNumber) {
+            console.log(chalk.dim('  Skipped — scanning unauthenticated.'));
+            console.log();
+            return null;
+        }
+
+        // Launch browser and navigate to trigger the login
+        console.log(chalk.dim('  Opening login form...'));
+        let browser;
+        try {
+            browser = await chromium.launch({ headless: true });
+        } catch (err) {
+            console.log(chalk.red(`  ✘ Could not launch browser: ${err.message}`));
+            return null;
+        }
+
+        const context = await browser.newContext({
+            viewport: { width: 1440, height: 900 },
+            ignoreHTTPSErrors: true,
+        });
+
+        const page = await context.newPage();
+
+        try {
+            await page.goto(loginUrl, { waitUntil: 'networkidle', timeout: 15000 });
+
+            // If login is behind a trigger button (modal), click it first
+            const triggerSelector = this.loginFormInfo?.triggerSelector;
+            if (triggerSelector) {
+                this.logger?.debug?.(`Clicking login trigger: ${triggerSelector}`);
+                const trigger = await page.$(triggerSelector);
+                if (trigger) {
+                    await trigger.click();
+                }
+            }
+
+            // Find the phone number field — wait for it to appear (modals may render async)
+            const phoneSelectors = [
+                'input[type="tel"]',
+                'input[id*="mobile"]', 'input[id*="phone"]',
+                'input[name*="phone"]', 'input[name*="mobile"]',
+                'input[placeholder*="phone" i]', 'input[placeholder*="mobile" i]',
+                'input[autocomplete="tel"]',
+            ];
+            const combinedPhoneSelector = phoneSelectors.join(', ');
+
+            // Wait up to 8s for any phone input to appear in the DOM
+            let phoneField = null;
+            try {
+                const foundEl = await page.waitForSelector(combinedPhoneSelector, {
+                    state: 'visible',
+                    timeout: 8000,
+                });
+                if (foundEl) {
+                    // Identify which specific selector matched
+                    for (const sel of phoneSelectors) {
+                        const el = await page.$(sel);
+                        if (el) {
+                            const isVisible = await el.isVisible().catch(() => false);
+                            if (isVisible) { phoneField = sel; break; }
+                        }
+                    }
+                }
+            } catch {
+                this.logger?.debug?.('Phone input did not appear within timeout');
+            }
+
+            if (!phoneField) {
+                console.log(chalk.red('  ✘ Could not find phone number input field'));
+                await page.close(); await context.close(); await browser.close();
+                return null;
+            }
+
+            this.logger?.debug?.(`Filling phone field: ${phoneField}`);
+            await page.fill(phoneField, phoneNumber);
+            await page.waitForTimeout(500);
+
+            // Find and click "Request OTP" / "Send OTP" / "Get OTP" button
+            const otpButtonSelectors = [
+                'button:has-text("Request OTP")', 'button:has-text("Send OTP")',
+                'button:has-text("Get OTP")', 'button:has-text("Verify")',
+                'button:has-text("Continue")', 'button:has-text("Next")',
+                'button:has-text("Submit")', 'button:has-text("Proceed")',
+                '[id*="otp"][role="button"]', '[id*="otp"] button',
+                'button[id*="otp"]', 'button[id*="get_otp"]',
+                'button[type="submit"]',
+            ];
+
+            let otpButtonClicked = false;
+            for (const sel of otpButtonSelectors) {
+                try {
+                    const btn = await page.$(sel);
+                    if (btn) {
+                        const isVisible = await btn.isVisible().catch(() => false);
+                        if (!isVisible) continue;
+                        // Check if button is enabled
+                        const isDisabled = await btn.isDisabled().catch(() => false);
+                        if (isDisabled) {
+                            await page.waitForTimeout(1000);
+                            const stillDisabled = await btn.isDisabled().catch(() => false);
+                            if (stillDisabled) continue;
+                        }
+                        this.logger?.debug?.(`Clicking OTP request button: ${sel}`);
+                        await btn.click();
+                        otpButtonClicked = true;
+                        break;
+                    }
+                } catch { /* try next */ }
+            }
+
+            if (!otpButtonClicked) {
+                // Fallback: press Enter to submit the form
+                this.logger?.debug?.('No OTP button found, pressing Enter');
+                await page.keyboard.press('Enter');
+            }
+
+            // Wait for OTP input to appear or page to transition
+            console.log(chalk.dim('  OTP requested — waiting for SMS...'));
+            await page.waitForTimeout(3000);
+
+            // Prompt for OTP
+            console.log();
+            const otp = await this._ask(chalk.dim('  Enter OTP received on your phone: '));
+            if (!otp) {
+                console.log(chalk.dim('  Skipped — scanning unauthenticated.'));
+                await page.close(); await context.close(); await browser.close();
+                return null;
+            }
+
+            // Find OTP input fields and fill them
+            // Some sites use a single input, others use multiple single-digit inputs
+            const otpFilled = await this._fillOTP(page, otp);
+
+            if (!otpFilled) {
+                console.log(chalk.red('  ✘ Could not find OTP input field'));
+                await page.close(); await context.close(); await browser.close();
+                return null;
+            }
+
+            // Find and click verify/submit button after OTP
+            const verifyButtonSelectors = [
+                'button[id*="verify"]', 'button[id*="otp"]',
+                'button:has-text("Verify")', 'button:has-text("Submit")',
+                'button:has-text("Confirm")', 'button:has-text("Log in")',
+                'button:has-text("Login")', 'button:has-text("Sign in")',
+                'button:has-text("Continue")', 'button:has-text("Proceed")',
+                'button[type="submit"]',
+            ];
+
+            let verifyClicked = false;
+            for (const sel of verifyButtonSelectors) {
+                try {
+                    const btn = await page.$(sel);
+                    if (btn) {
+                        const isVisible = await btn.isVisible().catch(() => false);
+                        if (isVisible) {
+                            this.logger?.debug?.(`Clicking verify button: ${sel}`);
+                            await btn.click();
+                            verifyClicked = true;
+                            break;
+                        }
+                    }
+                } catch { /* try next */ }
+            }
+
+            if (!verifyClicked) {
+                await page.keyboard.press('Enter');
+            }
+
+            // Wait for login to complete
+            console.log(chalk.dim('  Verifying OTP...'));
+            await page.waitForTimeout(5000);
+
+            // Verify we're logged in
+            const loggedIn = await this._verifyLogin(page, loginUrl);
+
+            if (loggedIn) {
+                const postLoginUrl = page.url();
+
+                // Discover links on authenticated page
+                const discoveredLinks = await page.evaluate(() => {
+                    return Array.from(document.querySelectorAll('a[href]'))
+                        .map(a => a.href)
+                        .filter(href => href && !href.startsWith('javascript:') && !href.startsWith('mailto:'));
+                }).catch(() => []);
+
+                const state = await context.storageState();
+                console.log(chalk.green('  ✔ OTP login successful!'));
+                console.log();
+                await page.close(); await context.close(); await browser.close();
+                this.authStates.set('user', { state, postLoginUrl, discoveredLinks });
+                return true;
+            } else {
+                console.log(chalk.red('  ✘ OTP verification failed — could not confirm login'));
+                console.log(chalk.dim('  Continuing with unauthenticated scan.'));
+                console.log();
+                await page.close(); await context.close(); await browser.close();
+                return null;
+            }
+        } catch (err) {
+            this.logger?.debug?.(`OTP login error: ${err.message}`);
+            console.log(chalk.red(`  ✘ OTP login error: ${err.message}`));
+            await page.close().catch(() => {});
+            await context.close().catch(() => {});
+            await browser.close().catch(() => {});
+            return null;
+        }
+    }
+
+    /**
+     * Fill OTP into the page.
+     * Handles both single-input and multi-digit-input OTP forms.
+     * Uses Playwright's type() for realistic key events that trigger framework handlers.
+     */
+    async _fillOTP(page, otp) {
+        // Wait a moment for OTP screen to fully render
+        await page.waitForTimeout(1000);
+
+        // Try 1: Multiple single-digit OTP inputs (most common modern pattern)
+        // Use Playwright's click + type for each input to trigger proper JS events
+        const multiDigitContainerSelectors = [
+            '[class*="otp"]', '[class*="OTP"]',
+            '[class*="verification-code"]', '[class*="pin-input"]',
+            '[class*="code-input"]',
+            '[id*="otp"]', '[id*="verification"]',
+        ];
+
+        // First check for multi-digit inputs in known containers
+        for (const containerSel of multiDigitContainerSelectors) {
+            try {
+                const container = await page.$(containerSel);
+                if (!container) continue;
+
+                const inputs = await container.$$('input');
+                if (inputs.length >= 4 && inputs.length <= 8) {
+                    this.logger?.debug?.(`Found ${inputs.length} OTP digit inputs in ${containerSel}`);
+                    const digits = otp.split('');
+                    for (let i = 0; i < Math.min(digits.length, inputs.length); i++) {
+                        await inputs[i].click();
+                        await inputs[i].fill('');  // Clear first
+                        await inputs[i].type(digits[i], { delay: 50 });
+                        await page.waitForTimeout(100); // Let framework handle focus shift
+                    }
+                    return true;
+                }
+            } catch { /* try next container */ }
+        }
+
+        // Try 2: maxlength=1 inputs anywhere on the page (generic multi-digit)
+        try {
+            const digitInputs = await page.$$('input[maxlength="1"]');
+            if (digitInputs.length >= 4 && digitInputs.length <= 8) {
+                this.logger?.debug?.(`Found ${digitInputs.length} maxlength=1 OTP inputs`);
+                const digits = otp.split('');
+                for (let i = 0; i < Math.min(digits.length, digitInputs.length); i++) {
+                    await digitInputs[i].click();
+                    await digitInputs[i].fill('');
+                    await digitInputs[i].type(digits[i], { delay: 50 });
+                    await page.waitForTimeout(100);
+                }
+                return true;
+            }
+        } catch { /* continue to single input */ }
+
+        // Try 3: Single OTP input field
+        const singleOtpSelectors = [
+            'input[name*="otp"]', 'input[id*="otp"]',
+            'input[autocomplete="one-time-code"]',
+            'input[placeholder*="OTP" i]',
+            'input[placeholder*="verification" i]',
+            'input[placeholder*="code" i]',
+            'input[type="number"][maxlength]',
+        ];
+
+        for (const sel of singleOtpSelectors) {
+            try {
+                const el = await page.$(sel);
+                if (el) {
+                    const isVisible = await el.isVisible().catch(() => false);
+                    if (isVisible) {
+                        this.logger?.debug?.(`Filling single OTP input: ${sel}`);
+                        await el.click();
+                        await el.fill(otp);
+                        return true;
+                    }
+                }
+            } catch { /* try next */ }
+        }
+
+        // Try 4: Any visible text/tel input that isn't the phone field
+        try {
+            const allInputs = await page.$$('input:visible');
+            for (const inp of allInputs) {
+                const type = await inp.getAttribute('type') || 'text';
+                const id = await inp.getAttribute('id') || '';
+                const name = await inp.getAttribute('name') || '';
+                // Skip inputs that look like phone/email fields
+                if (/phone|mobile|email/i.test(id + name)) continue;
+                if (type === 'hidden' || type === 'email') continue;
+                const isVisible = await inp.isVisible().catch(() => false);
+                if (isVisible) {
+                    this.logger?.debug?.(`Filling fallback input (type=${type}, id=${id})`);
+                    await inp.click();
+                    await inp.fill(otp);
+                    return true;
+                }
+            }
+        } catch { /* skip */ }
+
+        return false;
     }
 
     /**

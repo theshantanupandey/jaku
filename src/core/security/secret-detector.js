@@ -152,23 +152,8 @@ export class SecretDetector {
                 const secretValue = match[1] || match[0];
                 const maskedValue = this._maskSecret(secretValue);
 
-                // Skip obvious false positives (deny-list)
+                // Skip obvious false positives
                 if (this._isFalsePositive(secretValue, pattern.name)) continue;
-
-                // Fix 5: Shannon entropy filter — skip low-entropy matches for generic patterns
-                // High-confidence prefixed patterns (AWS, Stripe, etc.) skip this filter
-                const lowConfidencePatterns = ['Generic API Key', 'Generic Secret', 'Bearer Token in Code', 'JWT Token'];
-                if (lowConfidencePatterns.includes(pattern.name)) {
-                    const entropy = this._shannonEntropy(secretValue);
-                    if (entropy < 3.5) continue; // Below threshold = likely placeholder/variable name
-                }
-
-                // Context-aware check: examine the surrounding text for code patterns
-                const surroundStart = Math.max(0, match.index - 60);
-                const surroundEnd = Math.min(text.length, match.index + match[0].length + 60);
-                const surrounding = text.substring(surroundStart, surroundEnd);
-
-                if (this._isCodeContext(surrounding, secretValue, pattern.name)) continue;
 
                 this.findings.push(createFinding({
                     module: 'security',
@@ -188,25 +173,6 @@ export class SecretDetector {
                 }));
             }
         }
-    }
-
-    /**
-     * Fix 5: Shannon entropy — measures randomness of a string.
-     * Real secrets have high entropy (> 3.5); variable names and placeholders don't.
-     * @param {string} str
-     * @returns {number} entropy in bits
-     */
-    _shannonEntropy(str) {
-        if (!str || str.length === 0) return 0;
-        const freq = {};
-        for (const c of str) freq[c] = (freq[c] || 0) + 1;
-        let entropy = 0;
-        const len = str.length;
-        for (const count of Object.values(freq)) {
-            const p = count / len;
-            entropy -= p * Math.log2(p);
-        }
-        return entropy;
     }
 
     /**
@@ -394,59 +360,13 @@ export class SecretDetector {
         // Skip very short matches
         if (value.length < 8) return true;
         // Skip placeholder/example values
-        const placeholders = ['example', 'test', 'placeholder', 'your_', 'xxx', 'TODO', 'CHANGEME', 'sample', 'dummy', 'mock'];
+        const placeholders = ['example', 'test', 'placeholder', 'your_', 'xxx', 'TODO', 'CHANGEME', 'sample'];
         if (placeholders.some(p => value.toLowerCase().includes(p))) return true;
         // Skip if all same character
         if (/^(.)\1+$/.test(value)) return true;
 
-        // ── Bearer Token in Code false positives ──
-        if (patternName === 'Bearer Token in Code') {
-            // Skip format strings: Bearer ${token}, Bearer "+token, Bearer '+variable
-            if (/Bearer\s+[\$`{"'+]/.test(value)) return true;
-            // Skip template literals: Bearer ${...}
-            if (/Bearer\s+\$\{/.test(value)) return true;
-            // Skip concatenation patterns: Bearer "+, Bearer '+
-            if (/Bearer\s*["']\s*\+/.test(value)) return true;
-            // Skip if value after "Bearer " is a common variable name
-            const afterBearer = value.replace(/^Bearer\s+/, '');
-            const varNames = ['token', 'accesstoken', 'access_token', 'authtoken', 'auth_token', 'jwt', 'idtoken', 'id_token'];
-            if (varNames.includes(afterBearer.toLowerCase().replace(/["'`]/g, ''))) return true;
-        }
-
-        // ── JWT Token false positives ──
-        if (patternName === 'JWT Token') {
-            // Decode the header to check for example/test JWTs
-            try {
-                const header = JSON.parse(Buffer.from(value.split('.')[0], 'base64url').toString());
-                const payload = JSON.parse(Buffer.from(value.split('.')[1], 'base64url').toString());
-                // Skip if payload contains test/example indicators
-                if (payload.sub === 'test' || payload.sub === 'example' || payload.sub === '1234567890') return true;
-                if (payload.name === 'John Doe') return true; // jwt.io example
-            } catch {
-                // If we can't decode it, still check the string
-            }
-        }
-
         // ── Enhanced false-positive detection for Generic Secret / Generic API Key ──
         if (patternName === 'Generic Secret' || patternName === 'Generic API Key') {
-            // Reject common variable/property names that aren't actual secrets
-            const commonNames = [
-                'access_token', 'accesstoken', 'refresh_token', 'refreshtoken',
-                'client_secret', 'clientsecret', 'client_id', 'clientid',
-                'token_type', 'tokentype', 'grant_type', 'granttype',
-                'auth_token', 'authtoken', 'id_token', 'idtoken',
-                'session_token', 'sessiontoken', 'csrf_token', 'csrftoken',
-                'xsrf_token', 'xsrftoken', 'bearer_token', 'bearertoken',
-                'password_hash', 'passwordhash', 'password_salt', 'passwordsalt',
-                'secret_key', 'secretkey', 'api_secret', 'apisecret',
-                'token_secret', 'tokensecret', 'token_key', 'tokenkey',
-            ];
-            const cleanValue = value.toLowerCase().replace(/[\s"'`]/g, '');
-            if (commonNames.includes(cleanValue)) return true;
-
-            // Reject if the value is just a common word/identifier (no special chars, low entropy)
-            if (/^[a-z_][a-z0-9_]*$/i.test(value) && value.length < 20) return true;
-
             // Reject minified JS fragments: high ratio of special chars
             const specialCharRatio = (value.match(/[(){}\[\],;!?@#$%^&*~`<>|\\]/g) || []).length / value.length;
             if (specialCharRatio > 0.15) return true;
@@ -466,48 +386,6 @@ export class SecretDetector {
             // Require minimum entropy for generic matches
             const uniqueChars = new Set(value).size;
             if (uniqueChars < value.length * 0.3) return true;
-        }
-
-        // ── Fix 5: Extended deny-list for known false-positive patterns ──
-        // UUIDs (e.g. analytics IDs, tracking tokens, feature flags)
-        if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) return true;
-        // Hex hashes (MD5, SHA1, SHA256) — likely content hashes from bundlers
-        if (/^[0-9a-f]{32,64}$/i.test(value) && !/(?:key|token|secret|password|auth)/i.test(patternName)) return true;
-        // Base64 image/font data URIs
-        if (/^data:(?:image|font|application)\//.test(value)) return true;
-        // npm/yarn package checksums (sha512- prefix)
-        if (/^sha[0-9]+-/.test(value)) return true;
-        // Short alphanumeric identifiers (very likely variable/class names, not secrets)
-        if (/^[a-zA-Z][a-zA-Z0-9]{2,10}$/.test(value)) return true;
-
-        return false;
-    }
-
-    /**
-     * Context-aware check: examines the text surrounding a match to detect code patterns.
-     * Returns true if the match appears in a code context (variable assignment, property definition, etc.)
-     */
-    _isCodeContext(surrounding, value, patternName) {
-        // Skip context check for high-confidence patterns (AWS, Stripe, GitHub etc. have unique prefixes)
-        const highConfidence = ['AWS Access Key', 'AWS Secret Key', 'Stripe Live Key', 'Stripe Test Key',
-            'GitHub Token', 'GitHub OAuth', 'SendGrid API Key', 'Slack Token', 'Private Key', 'Database URL'];
-        if (highConfidence.includes(patternName)) return false;
-
-        // Check if the match is in a variable declaration / property assignment context
-        // e.g., const token = "...", { token: "..." }, token: "...",
-        const varDeclPattern = /(?:const|let|var|this\.)\s*\w+\s*=\s*["'`]/;
-        const propPattern = /["']?\w+["']?\s*:\s*["'`]/;
-        const templatePattern = /\$\{[^}]*\}/;
-
-        // If surrounding text has template literal interpolation, likely not a real secret
-        if (templatePattern.test(surrounding)) return true;
-
-        // If it's a Generic Secret and the surrounding looks like a schema/type definition
-        if (patternName === 'Generic Secret' || patternName === 'Generic API Key') {
-            // ORM/schema definitions: type: "string", required: true, etc.
-            if (/type\s*:\s*["']string["']/.test(surrounding)) return true;
-            // Config key definitions: { password: "", token: "" }
-            if (/["']\s*:\s*["']["']/.test(surrounding)) return true;
         }
 
         return false;

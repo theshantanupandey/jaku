@@ -7,23 +7,19 @@ import { OutputAnalyzer } from '../core/ai/output-analyzer.js';
 import { GuardrailProber } from '../core/ai/guardrail-prober.js';
 import { ModelDoSTester } from '../core/ai/model-dos-tester.js';
 import { IndirectInjector } from '../core/ai/indirect-injector.js';
-import { MultiTurnAttacker } from '../core/ai/multi-turn-attacker.js';
-import { ModelFingerprinter } from '../core/ai/model-fingerprinter.js';
 
 /**
  * JAKU-AI — Prompt Injection & AI Abuse Detection Agent
  * 
  * Pipeline:
  * 1. Detect AI endpoints (auto-discovery from surface inventory)
- * 2. Prompt Injection testing (many-shot, encoding, delimiter, context flood, RAG, CoT)
- * 3. Jailbreak testing (DAN, AIM, model-specific token attacks, persona anchoring)
+ * 2. Prompt Injection testing (24 payloads)
+ * 3. Jailbreak testing (16 techniques)
  * 4. System Prompt Extraction (17 techniques)
- * 5. Output Analysis (AI-mediated XSS, markdown rendering attacks)
- * 6. Guardrail Probing (PII, agency, tool abuse, SSRF, agentic tool injection)
+ * 5. Output Analysis (AI-mediated XSS)
+ * 6. Guardrail Probing (PII, agency, tool abuse)
  * 7. Model DoS Testing (context bombing, token loops)
  * 8. Indirect Injection Testing (6 embedded payloads)
- * 9. Multi-Turn Attack Testing (trust escalation, context drift, memory poisoning)
- * 10. Model Fingerprinting + Model-Specific Exploits
  * 
  * Dependencies: JAKU-CRAWL (runs in Wave 2, parallel with QA + SEC)
  */
@@ -138,35 +134,7 @@ export class AIAgent extends BaseAgent {
         } catch (err) {
             this._log(`Indirect injection testing failed: ${err.message}`, 'error');
         }
-        this.progress('indirect', 'Indirect injection testing complete', 95);
-
-        // Phase 9: Multi-Turn Attack Testing
-        this.progress('multiturn', 'Running multi-turn attack scenarios...', 95);
-        try {
-            const injector = new PromptInjector(logger);
-            const sendMsg = injector._sendMessage.bind(injector);
-            const multiTurnAttacker = new MultiTurnAttacker(logger);
-            const multiTurnFindings = await multiTurnAttacker.test(aiSurfaces, sendMsg);
-            this.addFindings(multiTurnFindings);
-            this._log(`Multi-turn attacks: ${multiTurnFindings.length} vulnerabilities`);
-        } catch (err) {
-            this._log(`Multi-turn testing failed: ${err.message}`, 'error');
-        }
-        this.progress('multiturn', 'Multi-turn attack testing complete', 97);
-
-        // Phase 10: Model Fingerprinting + Model-Specific Exploits
-        this.progress('fingerprint', 'Fingerprinting model and running model-specific attacks...', 97);
-        try {
-            const injector2 = new PromptInjector(logger);
-            const sendMsg2 = injector2._sendMessage.bind(injector2);
-            const fingerprinter = new ModelFingerprinter(logger);
-            const fingerprintFindings = await fingerprinter.test(aiSurfaces, sendMsg2);
-            this.addFindings(fingerprintFindings);
-            this._log(`Model fingerprinting: ${fingerprintFindings.length} findings`);
-        } catch (err) {
-            this._log(`Model fingerprinting failed: ${err.message}`, 'error');
-        }
-        this.progress('fingerprint', 'Model fingerprinting complete', 100);
+        this.progress('indirect', 'Indirect injection testing complete', 100);
 
         this.progress('complete', `AI scan complete — ${this._findings.length} total findings`, 100);
     }

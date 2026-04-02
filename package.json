@@ -1,6 +1,6 @@
 {
   "name": "jaku.sh",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "JAKU (呪) — Autonomous Security & Quality Intelligence Agent for vibe-coded apps. XSS, SQLi, prompt injection, QA testing, and attack chain correlation in one command.",
   "type": "module",
   "main": "src/cli.js",
@@ -55,7 +55,6 @@
     "commander": "^12.1.0",
     "nanoid": "^5.0.9",
     "ora": "^8.1.1",
-    "p-limit": "^7.3.0",
     "playwright": "^1.49.1",
     "winston": "^3.17.0"
   }

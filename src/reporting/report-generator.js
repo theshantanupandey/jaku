@@ -16,7 +16,7 @@ export class ReportGenerator {
   /**
    * Generate all reports from findings and test results.
    */
-  async generate({ findings, deduplicated, dedupStats, correlations, modules, testSummary, surfaceInventory, outputDir }) {
+  async generate({ findings, deduplicated, dedupStats, testSummary, surfaceInventory, outputDir }) {
     const reportDir = outputDir || path.join(process.cwd(), 'jaku-reports', this._timestamp());
     if (!fs.existsSync(reportDir)) {
       fs.mkdirSync(reportDir, { recursive: true });
@@ -35,15 +35,11 @@ export class ReportGenerator {
     const summary = severitySummary(filteredFindings);
     const dedupSummary = severitySummary(reportFindings);
 
-    const moduleList = modules || ['qa'];
-    const moduleLabel = moduleList.map(m => m.toUpperCase()).join(' + ');
-
     const reportData = {
       meta: {
         agent: 'JAKU',
-        version: '1.0.0',
-        modules: moduleList,
-        moduleLabel,
+        version: '1.0.1',
+        module: 'qa',
         target: this.config.target_url,
         scannedAt: new Date().toISOString(),
         duration: testSummary?.duration || null,
@@ -51,7 +47,6 @@ export class ReportGenerator {
       summary,
       dedupSummary,
       dedupStats: dedupStats || null,
-      correlations: correlations || [],
       testSummary: testSummary || {},
       surfaceInventory: {
         totalPages: surfaceInventory?.totalPages || 0,
@@ -65,15 +60,6 @@ export class ReportGenerator {
     // Generate JSON
     const jsonPath = path.join(reportDir, 'report.json');
     fs.writeFileSync(jsonPath, JSON.stringify(reportData, null, 2), 'utf-8');
-
-    // Copy to latest-report.json at project root for easy access
-    const latestPath = path.join(process.cwd(), 'latest-report.json');
-    try {
-      fs.copyFileSync(jsonPath, latestPath);
-      this.logger?.info?.(`Latest report copied to ${latestPath}`);
-    } catch {
-      // Non-critical — skip if CWD is read-only (e.g. CI)
-    }
 
     // Generate Markdown (uses deduped findings)
     const mdPath = path.join(reportDir, 'report.md');
@@ -97,12 +83,12 @@ export class ReportGenerator {
 
 
   _generateMarkdown(data) {
-    const { meta, dedupSummary: summary, correlations, testSummary, surfaceInventory, findings } = data;
+    const { meta, summary, testSummary, surfaceInventory, findings } = data;
     let md = '';
 
     md += `# 呪 JAKU Security & Quality Report\n\n`;
     md += `**Target:** ${meta.target}  \n`;
-    md += `**Modules:** ${meta.moduleLabel}  \n`;
+    md += `**Module:** Quality Assurance & Functional Testing  \n`;
     md += `**Scanned:** ${meta.scannedAt}  \n`;
     md += `**Agent Version:** ${meta.version}  \n\n`;
 
@@ -133,26 +119,6 @@ export class ReportGenerator {
     md += `| Pages Crawled | ${surfaceInventory.totalPages} |\n`;
     md += `| API Endpoints | ${surfaceInventory.totalApis} |\n`;
     md += `| Forms Tested | ${surfaceInventory.totalForms} |\n\n`;
-
-    // ── Correlations / Attack Chains ──
-    if (correlations && correlations.length > 0) {
-      md += `---\n\n`;
-      md += `## ⚡ Attack Chain Correlations (${correlations.length})\n\n`;
-      md += `> Correlations show how individual findings combine into exploitable attack chains.\n\n`;
-
-      for (const c of correlations) {
-        const sevIcon = { critical: '🔴', high: '🟠', medium: '🟡', low: '🔵', info: '⚪' }[c.severity] || '⚪';
-        md += `### ${sevIcon} ${c.title}\n\n`;
-        md += `**Type:** ${c.type === 'attack_chain' ? 'Attack Chain' : 'Defense Gap'}  \n`;
-        md += `**Severity:** ${c.severity.toUpperCase()}  \n`;
-        md += `**Exploitation:** ${c.exploitation}  \n\n`;
-        md += `${c.narrative}\n\n`;
-        if (c.findings && c.findings.length > 0) {
-          md += `**Linked Findings:** ${c.findings.join(', ')}\n\n`;
-        }
-        md += `---\n\n`;
-      }
-    }
 
     md += `---\n\n`;
     md += `## Findings\n\n`;
@@ -195,7 +161,7 @@ export class ReportGenerator {
   }
 
   _generateHTML(data) {
-    const { meta, dedupSummary: summary, correlations, testSummary, surfaceInventory, findings } = data;
+    const { meta, summary, testSummary, surfaceInventory, findings } = data;
     const sevColors = {
       critical: '#ff1744',
       high: '#ff6d00',
@@ -203,25 +169,6 @@ export class ReportGenerator {
       low: '#2979ff',
       info: '#90a4ae',
     };
-
-    // Build correlations HTML
-    const correlationsHTML = (correlations && correlations.length > 0) ? `
-  <h2>⚡ Attack Chain Correlations (${correlations.length})</h2>
-  <p style="color:var(--text-dim);font-size:0.85rem;margin-bottom:1rem">Correlations show how individual findings combine into exploitable attack chains.</p>
-  ${correlations.map(c => `
-  <div class="finding-card ${c.severity}" style="border-left-width:4px;border-left-style:solid">
-    <div class="finding-header">
-      <span class="finding-title">⚡ ${this._escapeHtml(c.title)}</span>
-      <span class="sev-badge ${c.severity}">${c.severity}</span>
-    </div>
-    <div style="font-size:0.8rem;color:var(--text-dim);margin:0.25rem 0">
-      <strong>Type:</strong> ${c.type === 'attack_chain' ? 'Attack Chain' : 'Defense Gap'}
-      &nbsp;·&nbsp;
-      <strong>Exploitation:</strong> ${this._escapeHtml(c.exploitation)}
-    </div>
-    <div class="finding-desc">${this._escapeHtml(c.narrative)}</div>
-    ${c.findings && c.findings.length > 0 ? `<div style="font-size:0.75rem;color:var(--accent);margin-top:0.5rem"><strong>Linked Findings:</strong> ${c.findings.join(', ')}</div>` : ''}
-  </div>`).join('')}` : '';
 
     return `<!DOCTYPE html>
 <html lang="en" data-theme="dark">
@@ -306,7 +253,7 @@ export class ReportGenerator {
   <h1>呪 JAKU</h1>
   <div class="meta">
     <span>Target: ${meta.target}</span>
-    <span>Modules: ${meta.moduleLabel}</span>
+    <span>Module: QA & Functional Testing</span>
     <span>Scanned: ${new Date(meta.scannedAt).toLocaleString()}</span>
   </div>
 
@@ -340,8 +287,6 @@ export class ReportGenerator {
     <div class="summary-card"><div class="count" style="color:var(--critical)">${testSummary.failed + (testSummary.errors || 0)}</div><div class="label">Failed</div></div>
     ` : ''}
   </div>
-
-  ${correlationsHTML}
 
   <h2>Findings (${summary.total})</h2>
   <div class="filter-bar">

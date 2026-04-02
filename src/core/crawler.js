@@ -1,43 +1,51 @@
-import { BrowserManager } from './browser-manager.js';
-import pLimit from 'p-limit';
+import { chromium } from 'playwright';
 import { createFinding } from '../utils/finding.js';
 
+/**
+ * Parallel, rate-limit-aware Crawler with JS API discovery.
+ *
+ * Improvements over v1:
+ *   - Worker-pool based parallel crawling (configurable concurrency)
+ *   - Intercepts all fetch()/XHR network requests for API discovery
+ *   - Detects 429/503 rate limiting and backs off automatically
+ */
 export class Crawler {
     constructor(config, logger) {
         this.config = config;
         this.logger = logger;
+
+        // State
         this.visited = new Set();
         this.surfaces = [];
         this.apiEndpoints = [];
         this.forms = [];
         this.consoleErrors = [];
         this.failedRequests = [];
+
+        // Config
         this.maxPages = config.crawler?.max_pages || 50;
         this.maxDepth = config.crawler?.max_depth || 5;
         this.timeout = config.crawler?.timeout || 30000;
-
-        // Fix 1 & 3: Concurrency + rate limiting
-        this.concurrency = config.crawler?.concurrency || 5;
-        this.delayMs = config.crawler?.delay_ms ?? 100; // 100ms default polite delay
-
+        this.concurrency = config.crawler?.concurrency || 4;
         this.baseUrl = null;
-        this._queue = [];
-        this._limit = null;
+
+        // Rate limiting state
+        this._rateLimitHits = 0;
+        this._backoffMs = 0;
+        this._rateLimited = false;
     }
 
     /**
      * Main crawl entry point. Returns a SurfaceInventory.
+     * Uses a worker-pool pattern for parallel crawling.
+     *
      * @param {string} targetUrl - URL to crawl
      * @param {object} [authState] - Playwright storageState for authenticated crawling
      * @param {string[]} [seedLinks] - Additional URLs to crawl (e.g., from post-login page)
      */
     async crawl(targetUrl, authState = null, seedLinks = []) {
         this.baseUrl = new URL(targetUrl);
-
-        // Fix 1: Create a concurrency limiter (default: 5 pages in parallel)
-        this._limit = pLimit(this.concurrency);
-
-        const browser = await BrowserManager.launch({ headless: true });
+        const browser = await chromium.launch({ headless: true });
 
         const contextOptions = {
             viewport: { width: 1440, height: 900 },
@@ -51,30 +59,16 @@ export class Crawler {
         const context = await browser.newContext(contextOptions);
 
         try {
-            // Seed initial URL(s) and process the queue
-            this._enqueue(targetUrl, 0);
-
-            // Also enqueue seed links (authenticated pages discovered during login)
+            // Build initial queue: target URL + seed links
+            const queue = [{ url: targetUrl, depth: 0 }];
             for (const link of seedLinks) {
                 if (this._isSameOrigin(link)) {
-                    this._enqueue(link, 0);
+                    queue.push({ url: link, depth: 0 });
                 }
             }
 
-            // Process the queue until empty or limits reached
-            await this._processQueue(context);
-
-            // Backup discovery: if crawl found very few pages, try sitemap.xml and robots.txt
-            if (this.surfaces.length <= 2) {
-                this.logger?.info?.('Few pages discovered — trying sitemap.xml and robots.txt as backup discovery');
-                const backupLinks = await this._discoverBackupLinks(targetUrl);
-                for (const link of backupLinks) {
-                    if (!this.visited.has(this._normalizeUrl(link)) && this._isSameOrigin(link)) {
-                        this._enqueue(link, 1);
-                    }
-                }
-                await this._processQueue(context);
-            }
+            // Run parallel workers that drain the queue
+            await this._runParallelCrawl(context, queue);
         } finally {
             await browser.close();
         }
@@ -91,50 +85,98 @@ export class Crawler {
             authenticated: !!authState,
         };
 
-        this.logger?.info?.(`Crawl complete: ${inventory.totalPages} pages, ${inventory.totalApis} APIs, ${inventory.totalForms} forms${authState ? ' (authenticated)' : ''}`);
+        this.logger?.info?.(
+            `Crawl complete: ${inventory.totalPages} pages, ${inventory.totalApis} APIs, ` +
+            `${inventory.totalForms} forms${authState ? ' (authenticated)' : ''} ` +
+            `[concurrency=${this.concurrency}]`
+        );
         return inventory;
     }
 
-    /**
-     * Add a URL to the crawl queue.
-     */
-    _enqueue(url, depth) {
-        const normalized = this._normalizeUrl(url);
-        if (this.visited.has(normalized)) return;
-        if (!this._isSameOrigin(url)) return;
-        if (depth > this.maxDepth) return;
-        if (this.visited.size >= this.maxPages) return;
+    // ── Parallel Worker Pool ──────────────────────────────
 
-        // Mark as visited immediately to prevent duplicate queueing
-        this.visited.add(normalized);
-        this._queue.push({ url, depth });
+    /**
+     * Spawns N workers that consume URLs from a shared queue.
+     * Workers stop when the queue is empty AND no other worker is active.
+     */
+    async _runParallelCrawl(context, queue) {
+        let activeWorkers = 0;
+        let queueIndex = 0;
+        const effectiveConcurrency = Math.min(this.concurrency, 8);
+
+        const self = this;
+
+        return new Promise((resolve) => {
+            function tryDequeue() {
+                // Abort if rate limited too many times
+                if (self._rateLimitHits >= 5) {
+                    self.logger?.warn?.('[JAKU-CRAWL] Too many rate limit responses — aborting crawl with partial results');
+                    if (activeWorkers === 0) resolve();
+                    return;
+                }
+
+                while (activeWorkers < effectiveConcurrency && queueIndex < queue.length) {
+                    if (self.visited.size >= self.maxPages) break;
+
+                    const item = queue[queueIndex++];
+                    const normalizedUrl = self._normalizeUrl(item.url);
+
+                    // Skip already visited or off-origin
+                    if (self.visited.has(normalizedUrl) || !self._isSameOrigin(item.url)) {
+                        continue;
+                    }
+                    if (item.depth > self.maxDepth) continue;
+
+                    self.visited.add(normalizedUrl);
+                    activeWorkers++;
+
+                    // Crawl this page in a worker
+                    self._crawlPage(context, item.url, item.depth)
+                        .then((discoveredLinks) => {
+                            // Enqueue discovered links
+                            for (const link of discoveredLinks) {
+                                if (self.visited.size + (queue.length - queueIndex) >= self.maxPages * 2) break;
+                                queue.push({ url: link, depth: item.depth + 1 });
+                            }
+                        })
+                        .catch((err) => {
+                            self.logger?.debug?.(`Worker error: ${err.message}`);
+                        })
+                        .finally(() => {
+                            activeWorkers--;
+                            // Try to pick up more work
+                            if (activeWorkers === 0 && queueIndex >= queue.length) {
+                                resolve();
+                            } else {
+                                tryDequeue();
+                            }
+                        });
+                }
+
+                // If no workers active and nothing left, resolve
+                if (activeWorkers === 0 && queueIndex >= queue.length) {
+                    resolve();
+                }
+            }
+
+            tryDequeue();
+        });
     }
 
-    /**
-     * Drain the queue concurrently up to the concurrency limit.
-     */
-    async _processQueue(context) {
-        while (this._queue.length > 0 && this.surfaces.length < this.maxPages) {
-            const batch = this._queue.splice(0, this._queue.length);
-            const tasks = batch
-                .filter(() => this.surfaces.length < this.maxPages)
-                .map(({ url, depth }) =>
-                    this._limit(() => this._crawlPage(context, url, depth))
-                );
-            await Promise.allSettled(tasks);
-        }
-    }
+    // ── Single Page Crawler ──────────────────────────────
 
     /**
-     * Crawls a single page and enqueues discovered links.
+     * Crawls a single page. Returns an array of discovered link URLs.
      */
     async _crawlPage(context, url, depth) {
-        // Fix 3: Polite delay between requests
-        if (this.delayMs > 0) {
-            await new Promise(r => setTimeout(r, this.delayMs));
+        const normalizedUrl = this._normalizeUrl(url);
+
+        // Rate limit backoff
+        if (this._backoffMs > 0) {
+            this.logger?.debug?.(`Rate limit backoff: waiting ${this._backoffMs}ms`);
+            await new Promise(r => setTimeout(r, this._backoffMs));
         }
 
-        const normalizedUrl = this._normalizeUrl(url);
         const page = await context.newPage();
         const pageData = {
             url: normalizedUrl,
@@ -148,10 +190,11 @@ export class Crawler {
             loadTime: 0,
         };
 
-        // Monitor console and network
         const consoleMessages = [];
         const failedReqs = [];
+        const discoveredLinks = [];
 
+        // ── Monitor console ──
         page.on('console', msg => {
             if (msg.type() === 'error') {
                 consoleMessages.push({
@@ -179,70 +222,71 @@ export class Crawler {
             });
         });
 
-        // Intercept API calls
+        // ── JS API Discovery: Intercept ALL network requests ──
         page.on('response', response => {
-            const reqUrl = response.url();
-            const contentType = response.headers()['content-type'] || '';
+            try {
+                const reqUrl = response.url();
+                const method = response.request().method();
+                const status = response.status();
+                const contentType = response.headers()['content-type'] || '';
+                const resourceType = response.request().resourceType();
 
-            // Fix 3: Respect Retry-After header
-            const retryAfter = response.headers()['retry-after'];
-            if (retryAfter && (response.status() === 429 || response.status() === 503)) {
-                const waitMs = Math.min(parseInt(retryAfter, 10) * 1000 || 5000, 30000);
-                this.logger?.warn?.(`Rate limited (${response.status()}) — backing off ${waitMs}ms`);
-                // Increase delay temporarily
-                this.delayMs = Math.max(this.delayMs, waitMs);
-            }
-
-            if (contentType.includes('application/json') && this._isSameOrigin(reqUrl)) {
-                const existing = this.apiEndpoints.find(e => e.url === reqUrl && e.method === response.request().method());
-                if (!existing) {
-                    this.apiEndpoints.push({
-                        url: reqUrl,
-                        method: response.request().method(),
-                        status: response.status(),
-                        contentType,
-                    });
+                // Rate limit detection
+                if (status === 429 || status === 503) {
+                    this._handleRateLimit(status, reqUrl);
+                } else if (status >= 200 && status < 400) {
+                    this._resetRateLimit();
                 }
+
+                // Discover API endpoints — expanded detection
+                if (this._isSameOrigin(reqUrl) && this._isApiRequest(reqUrl, contentType, resourceType, method)) {
+                    const apiKey = `${method}::${this._stripQueryParams(reqUrl)}`;
+                    const existing = this.apiEndpoints.find(e => `${e.method}::${this._stripQueryParams(e.url)}` === apiKey);
+                    if (!existing) {
+                        const hasAuthHeader = !!(
+                            response.request().headers()['authorization'] ||
+                            response.request().headers()['x-api-key'] ||
+                            response.request().headers()['x-auth-token']
+                        );
+                        this.apiEndpoints.push({
+                            url: reqUrl,
+                            method,
+                            status,
+                            contentType,
+                            authenticated: hasAuthHeader,
+                            discoveredVia: 'network-intercept',
+                        });
+                    }
+                }
+            } catch {
+                // Ignore response parsing errors
             }
         });
 
         try {
             const startTime = Date.now();
-
-            // Progressive fallback: networkidle → load → domcontentloaded
-            let response = null;
-            const strategies = ['networkidle', 'load', 'domcontentloaded'];
-
-            for (const strategy of strategies) {
-                try {
-                    const strategyTimeout = strategy === 'networkidle' ? this.timeout : Math.min(this.timeout, 15000);
-                    response = await page.goto(url, {
-                        waitUntil: strategy,
-                        timeout: strategyTimeout,
-                    });
-                    this.logger?.debug?.(`Page loaded with '${strategy}' strategy: ${normalizedUrl}`);
-                    break;
-                } catch (navErr) {
-                    if (strategy !== strategies[strategies.length - 1]) {
-                        this.logger?.debug?.(`'${strategy}' timed out for ${normalizedUrl}, trying '${strategies[strategies.indexOf(strategy) + 1]}'`);
-                    } else {
-                        this.logger?.warn?.(`All load strategies failed for ${normalizedUrl}: ${navErr.message}`);
-                    }
-                }
-            }
-
+            const response = await page.goto(url, {
+                waitUntil: 'networkidle',
+                timeout: this.timeout,
+            });
             pageData.loadTime = Date.now() - startTime;
             pageData.status = response?.status() || null;
-            pageData.title = await page.title().catch(() => '');
+            pageData.title = await page.title();
+
+            // Rate limit check on main page response
+            if (pageData.status === 429 || pageData.status === 503) {
+                this._handleRateLimit(pageData.status, normalizedUrl);
+            }
 
             // Extract links
             const links = await page.evaluate(() => {
                 const anchors = Array.from(document.querySelectorAll('a[href]'));
                 return anchors.map(a => a.href).filter(href => href && !href.startsWith('javascript:'));
-            }).catch(() => []);
+            });
             pageData.links = [...new Set(links)];
+            discoveredLinks.push(...pageData.links);
 
-            // Extract forms
+            // Extract forms (with CSRF token detection for downstream)
             const pageForms = await page.evaluate(() => {
                 return Array.from(document.querySelectorAll('form')).map((form, idx) => {
                     const fields = Array.from(form.querySelectorAll('input, select, textarea')).map(field => ({
@@ -254,7 +298,13 @@ export class Crawler {
                         pattern: field.pattern || '',
                         minLength: field.minLength > 0 ? field.minLength : null,
                         maxLength: field.maxLength > 0 ? field.maxLength : null,
+                        value: field.type === 'hidden' ? field.value : undefined,
                     }));
+
+                    // Check for CSRF meta tags
+                    const csrfMeta = document.querySelector(
+                        'meta[name="csrf-token"], meta[name="_csrf"], meta[name="csrf-param"]'
+                    );
 
                     return {
                         action: form.action || window.location.href,
@@ -262,15 +312,21 @@ export class Crawler {
                         id: form.id || `form-${idx}`,
                         fields,
                         hasSubmitButton: !!form.querySelector('button[type="submit"], input[type="submit"]'),
+                        hasCsrfToken: fields.some(f =>
+                            ['_csrf', 'csrf_token', '_token', 'authenticity_token', '__RequestVerificationToken', 'csrfmiddlewaretoken']
+                                .includes(f.name?.toLowerCase())
+                        ),
+                        hasCsrfMeta: !!csrfMeta,
                     };
                 });
-            }).catch(() => []);
+            });
 
             for (const form of pageForms) {
                 form.page = normalizedUrl;
                 this.forms.push(form);
             }
             pageData.forms = pageForms;
+
             pageData.consoleErrors = consoleMessages;
             pageData.failedRequests = failedReqs;
 
@@ -278,37 +334,82 @@ export class Crawler {
             this.failedRequests.push(...failedReqs);
             this.surfaces.push(pageData);
 
-            this.logger?.debug?.(`Crawled: ${normalizedUrl} (${pageData.status}) - ${links.length} links, ${pageForms.length} forms`);
-
-            // Enqueue discovered links (non-blocking — queue is processed above)
-            if (depth < this.maxDepth) {
-                for (const link of pageData.links) {
-                    this._enqueue(link, depth + 1);
-                }
-            }
+            this.logger?.debug?.(
+                `Crawled: ${normalizedUrl} (${pageData.status}) - ` +
+                `${links.length} links, ${pageForms.length} forms [depth=${depth}]`
+            );
         } catch (err) {
-            const partialLinks = await page.evaluate(() => {
-                const anchors = Array.from(document.querySelectorAll('a[href]'));
-                return anchors.map(a => a.href).filter(href => href && !href.startsWith('javascript:'));
-            }).catch(() => []);
-
             pageData.status = 'error';
             pageData.error = err.message;
-            pageData.links = [...new Set(partialLinks)];
             this.surfaces.push(pageData);
-            this.logger?.warn?.(`Failed to crawl ${normalizedUrl}: ${err.message}${partialLinks.length > 0 ? ` (extracted ${partialLinks.length} partial links)` : ''}`);
-
-            if (depth < this.maxDepth) {
-                for (const link of partialLinks) {
-                    if (this._isSameOrigin(link)) {
-                        this._enqueue(link, depth + 1);
-                    }
-                }
-            }
+            this.logger?.warn?.(`Failed to crawl ${normalizedUrl}: ${err.message}`);
         } finally {
             await page.close();
         }
+
+        return discoveredLinks;
     }
+
+    // ── Rate Limiting ────────────────────────────────────
+
+    _handleRateLimit(status, url) {
+        this._rateLimitHits++;
+        const delays = [2000, 5000, 10000, 15000, 20000];
+        this._backoffMs = delays[Math.min(this._rateLimitHits - 1, delays.length - 1)];
+
+        this.logger?.warn?.(
+            `[JAKU-CRAWL] Rate limited (${status}) on ${url} — ` +
+            `backing off ${this._backoffMs}ms (hit #${this._rateLimitHits})`
+        );
+
+        // Reduce concurrency on repeated rate limits
+        if (this._rateLimitHits >= 3 && this.concurrency > 1) {
+            this.concurrency = 1;
+            this.logger?.warn?.('[JAKU-CRAWL] Reduced concurrency to 1 due to rate limiting');
+        }
+    }
+
+    _resetRateLimit() {
+        if (this._rateLimitHits > 0) {
+            this._rateLimitHits = Math.max(0, this._rateLimitHits - 1);
+            if (this._rateLimitHits === 0) {
+                this._backoffMs = 0;
+            }
+        }
+    }
+
+    // ── API Detection ────────────────────────────────────
+
+    /**
+     * Determine if a network request is an API call.
+     * Expanded from v1: detects JSON, API paths, fetch/XHR, GraphQL.
+     */
+    _isApiRequest(url, contentType, resourceType, method) {
+        // JSON responses are always API calls
+        if (contentType.includes('application/json')) return true;
+
+        // GraphQL endpoint
+        if (url.includes('/graphql')) return true;
+
+        // Common API path patterns
+        const apiPatterns = ['/api/', '/v1/', '/v2/', '/v3/', '/rest/', '/_api/', '/wp-json/'];
+        if (apiPatterns.some(p => url.includes(p))) return true;
+
+        // fetch/XHR requests that aren't standard page resources
+        if (resourceType === 'fetch' || resourceType === 'xhr') {
+            // Exclude static assets
+            const staticExts = ['.js', '.css', '.png', '.jpg', '.svg', '.woff', '.woff2', '.ico'];
+            const urlPath = new URL(url).pathname;
+            if (!staticExts.some(ext => urlPath.endsWith(ext))) return true;
+        }
+
+        // Non-GET requests to same origin are likely API calls
+        if (method !== 'GET' && method !== 'OPTIONS') return true;
+
+        return false;
+    }
+
+    // ── URL Helpers ──────────────────────────────────────
 
     _normalizeUrl(url) {
         try {
@@ -324,105 +425,21 @@ export class Crawler {
         }
     }
 
+    _stripQueryParams(url) {
+        try {
+            const u = new URL(url);
+            return `${u.origin}${u.pathname}`;
+        } catch {
+            return url;
+        }
+    }
+
     _isSameOrigin(url) {
         try {
             const u = new URL(url);
             return u.origin === this.baseUrl.origin;
         } catch {
             return false;
-        }
-    }
-
-    /**
-     * Backup link discovery via sitemap.xml and robots.txt.
-     */
-    async _discoverBackupLinks(targetUrl) {
-        const discovered = new Set();
-        await this._discoverFromSitemap(targetUrl, discovered);
-        await this._discoverFromRobots(targetUrl, discovered);
-        const newLinks = [...discovered].filter(link => !this.visited.has(this._normalizeUrl(link)));
-        if (newLinks.length > 0) {
-            this.logger?.info?.(`Backup discovery found ${newLinks.length} new URLs from sitemap/robots`);
-        }
-        return newLinks;
-    }
-
-    async _discoverFromSitemap(targetUrl, discovered) {
-        const sitemapUrls = [
-            new URL('/sitemap.xml', targetUrl).toString(),
-            new URL('/sitemap_index.xml', targetUrl).toString(),
-        ];
-
-        for (const sitemapUrl of sitemapUrls) {
-            try {
-                const resp = await fetch(sitemapUrl, {
-                    signal: AbortSignal.timeout(10000),
-                    redirect: 'follow',
-                });
-                if (!resp.ok) continue;
-
-                const contentType = resp.headers.get('content-type') || '';
-                if (!contentType.includes('xml') && !contentType.includes('text')) continue;
-
-                const body = await resp.text();
-                const locMatches = body.matchAll(/<loc>\s*(https?:\/\/[^<]+)\s*<\/loc>/gi);
-                for (const match of locMatches) {
-                    const url = match[1].trim();
-                    if (this._isSameOrigin(url)) {
-                        discovered.add(url);
-                    }
-                    if (url.includes('sitemap') && url.endsWith('.xml')) {
-                        await this._discoverFromSitemap(url, discovered);
-                    }
-                }
-
-                this.logger?.debug?.(`Parsed sitemap: ${sitemapUrl} → ${discovered.size} URLs`);
-            } catch {
-                // Sitemap not available
-            }
-        }
-    }
-
-    async _discoverFromRobots(targetUrl, discovered) {
-        try {
-            const robotsUrl = new URL('/robots.txt', targetUrl).toString();
-            const resp = await fetch(robotsUrl, {
-                signal: AbortSignal.timeout(10000),
-                redirect: 'follow',
-            });
-            if (!resp.ok) return;
-
-            const body = await resp.text();
-            const lines = body.split('\n');
-
-            for (const line of lines) {
-                const trimmed = line.trim();
-
-                if (trimmed.toLowerCase().startsWith('sitemap:')) {
-                    const sitemapUrl = trimmed.substring(8).trim();
-                    if (sitemapUrl.startsWith('http')) {
-                        await this._discoverFromSitemap(sitemapUrl, discovered);
-                    }
-                }
-
-                if (trimmed.toLowerCase().startsWith('disallow:')) {
-                    const path = trimmed.substring(9).trim();
-                    if (path && path !== '/' && path !== '*' && !path.includes('*')) {
-                        try {
-                            const fullUrl = new URL(path, targetUrl).toString();
-                            if (this._isSameOrigin(fullUrl)) {
-                                discovered.add(fullUrl);
-                            }
-                        } catch {
-                            // Invalid path
-                        }
-                    }
-                }
-            }
-
-            this.logger?.debug?.(`Parsed robots.txt → ${discovered.size} URLs`);
-        } catch {
-            // robots.txt not available
         }
     }
 }

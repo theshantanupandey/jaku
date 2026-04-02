@@ -1,6 +1,5 @@
-import { BrowserManager } from './browser-manager.js';
+import { chromium } from 'playwright';
 import { createFinding } from '../utils/finding.js';
-import { CSRWaiter } from './csr-waiter.js';
 import fs from 'fs';
 import path from 'path';
 
@@ -14,7 +13,6 @@ export class TestRunner {
         this.logger = logger;
         this.results = [];
         this.findings = [];
-        this._pendingFailures = []; // collected before grouping
         this.screenshotDir = path.join(config.output_dir || 'jaku-reports', 'screenshots');
     }
 
@@ -26,7 +24,7 @@ export class TestRunner {
             fs.mkdirSync(this.screenshotDir, { recursive: true });
         }
 
-        const browser = await BrowserManager.launch({ headless: true });
+        const browser = await chromium.launch({ headless: true });
         const context = await browser.newContext({
             viewport: { width: 1440, height: 900 },
             ignoreHTTPSErrors: true,
@@ -45,7 +43,7 @@ export class TestRunner {
                     passed++;
                 } else {
                     failed++;
-                    this._collectFailure(result);
+                    this._createFindingFromResult(result);
                 }
             } catch (err) {
                 errors++;
@@ -56,14 +54,11 @@ export class TestRunner {
                     duration: 0,
                 };
                 this.results.push(errorResult);
-                this._collectFailure(errorResult);
+                this._createFindingFromResult(errorResult);
             }
         }
 
         await browser.close();
-
-        // Emit grouped findings (one per root-cause pattern, not one per URL)
-        this._emitGroupedFindings();
 
         const summary = { total: testCases.length, passed, failed, errors };
         this.logger?.info?.(`Tests complete: ${passed} passed, ${failed} failed, ${errors} errors`);
@@ -76,39 +71,30 @@ export class TestRunner {
     async _executeTest(context, testCase) {
         const page = await context.newPage();
         const startTime = Date.now();
-        const csrWaiter = new CSRWaiter(this.logger);
+        const consoleErrors = [];
         let status = 'pass';
         let failureReason = '';
 
-        // Use CSRWaiter's filtered console listener — suppresses Supabase auth
-        // loading noise so it doesn't false-positive on smoke tests
-        const consoleErrors = CSRWaiter.installConsoleFilter(page);
-
-        page.on('pageerror', error => {
-            // Also filter page-level errors through the noise filter
-            if (CSRWaiter.isRealError(error.message)) {
-                consoleErrors.push({ type: 'exception', text: error.message, timestamp: Date.now(), url: page.url() });
+        page.on('console', msg => {
+            if (msg.type() === 'error') {
+                consoleErrors.push(msg.text());
             }
         });
 
-        try {
-            for (let i = 0; i < testCase.steps.length; i++) {
-                const step = testCase.steps[i];
-                await this._executeStep(page, step, testCase);
+        page.on('pageerror', error => {
+            consoleErrors.push(error.message);
+        });
 
-                // After the first navigation step, wait for CSR content to settle
-                // This is the key fix for Supabase/Clerk/CSR app false positives
-                if (i === 0 && (step.action === 'navigate' || step.action === 'goto')) {
-                    await csrWaiter.waitForContent(page, { timeout: 12000 });
-                }
+        try {
+            for (const step of testCase.steps) {
+                await this._executeStep(page, step, testCase);
             }
 
             // Validate expected outcomes
             if (testCase.type === 'smoke') {
-                const realErrorCount = consoleErrors.filter(e => e.type === 'error' || e.type === 'exception').length;
-                if (realErrorCount > 0 && testCase.expected.noConsoleErrors) {
+                if (consoleErrors.length > 0 && testCase.expected.noConsoleErrors) {
                     status = 'fail';
-                    failureReason = `Console errors detected: ${consoleErrors.map(e => e.text).join('; ')}`;
+                    failureReason = `Console errors detected: ${consoleErrors.join('; ')}`;
                 }
             }
         } catch (err) {
@@ -276,103 +262,39 @@ export class TestRunner {
     }
 
     /**
-     * Collect a failure for later grouping (do not emit immediately).
-     */
-    _collectFailure(result) {
-        this._pendingFailures.push(result);
-    }
-
-    /**
-     * Group collected failures by (type + normalized root cause) and emit one finding per group.
-     *
-     * Example: 49 smoke failures with "Page has no visible content (empty body)" on /trips/:uuid
-     * becomes ONE high finding with all 49 URLs listed in the description.
-     */
-    _emitGroupedFindings() {
-        // Group key: type + root-cause message (first ~80 chars to normalize minor variance)
-        const groups = new Map();
-
-        for (const result of this._pendingFailures) {
-            const { testCase, failureReason, error } = result;
-            const message = (failureReason || error || 'Test failed').substring(0, 80);
-            const key = `${testCase.type}::${message}`;
-
-            if (!groups.has(key)) {
-                groups.set(key, {
-                    type: testCase.type,
-                    message,
-                    results: [],
-                    firstTestCase: testCase,
-                });
-            }
-            groups.get(key).results.push(result);
-        }
-
-        for (const [, group] of groups) {
-            const { type, message, results, firstTestCase } = group;
-            const count = results.length;
-            const urls = results.map(r => r.testCase.surface).filter(Boolean);
-
-            const severityMap = {
-                'smoke': 'high',
-                'navigation': 'medium',
-                'form': 'medium',
-                'api': 'high',
-                'edge-case': 'low',
-            };
-
-            // For a group of 1, preserve the original specific title.
-            // For groups of 2+, produce a single grouped finding.
-            const title = count === 1
-                ? `Test Failed: ${firstTestCase.title}`
-                : `Test Failed (${count}x): ${message}`;
-
-            const description = count === 1
-                ? `Test "${firstTestCase.title}" (${type}) failed: ${message}`
-                : `${count} pages share the same root cause: "${message}"\n\nAffected URLs:\n${urls.map(u => `  - ${u}`).join('\n')}`;
-
-            this.findings.push(
-                createFinding({
-                    module: 'qa',
-                    title,
-                    severity: severityMap[type] || 'medium',
-                    affected_surface: count === 1 ? firstTestCase.surface : urls[0],
-                    description,
-                    reproduction: count === 1
-                        ? firstTestCase.steps.map((s, i) =>
-                            `${i + 1}. ${s.action}${s.url ? ` → ${s.url}` : ''}${s.value ? ` with value "${String(s.value).substring(0, 50)}"` : ''}`
-                        )
-                        : [
-                            `1. navigate → any of the ${count} affected URLs`,
-                            `2. assert_status (expect 200)`,
-                            `3. assert_has_content`,
-                            `4. Fails with: ${message}`,
-                        ],
-                    evidence: JSON.stringify({
-                        groupedCount: count,
-                        rootCause: message,
-                        testType: type,
-                        affectedUrls: urls,
-                        firstTestId: firstTestCase.id,
-                    }, null, 2),
-                    remediation: this._getRemediation(firstTestCase, message),
-                })
-            );
-        }
-
-        if (this._pendingFailures.length > 0) {
-            this.logger?.info?.(`Test findings: ${this._pendingFailures.length} failures → ${this.findings.length} grouped findings`);
-        }
-    }
-
-    /**
-     * Create a finding from a failed test (legacy single-emit path — kept for direct calls).
+     * Create a finding from a failed test result.
      */
     _createFindingFromResult(result) {
-        // Redirect to the grouping path
-        this._collectFailure(result);
-        this._emitGroupedFindings();
-        this._pendingFailures = [];
+        const { testCase, failureReason, error } = result;
+        const message = failureReason || error || 'Test failed';
+
+        const severityMap = {
+            'smoke': 'high',
+            'navigation': 'medium',
+            'form': 'medium',
+            'api': 'high',
+            'edge-case': 'low',
+        };
+
+        this.findings.push(
+            createFinding({
+                module: 'qa',
+                title: `Test Failed: ${testCase.title}`,
+                severity: severityMap[testCase.type] || 'medium',
+                affected_surface: testCase.surface,
+                description: `Test "${testCase.title}" (${testCase.type}) failed: ${message}`,
+                reproduction: testCase.steps.map((s, i) =>
+                    `${i + 1}. ${s.action}${s.url ? ` → ${s.url}` : ''}${s.value ? ` with value "${String(s.value).substring(0, 50)}"` : ''}`
+                ),
+                evidence: JSON.stringify({
+                    testId: testCase.id,
+                    type: testCase.type,
+                    failure: message,
+                    duration: result.duration,
+                }, null, 2),
+                remediation: this._getRemediation(testCase, message),
+            })
+        );
     }
 
     _getRemediation(testCase, message) {

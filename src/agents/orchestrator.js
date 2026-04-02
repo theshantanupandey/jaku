@@ -1,6 +1,5 @@
 import { EventBus } from './event-bus.js';
 import { FindingsLedger } from './findings-ledger.js';
-import { BrowserManager } from '../core/browser-manager.js';
 
 /**
  * Orchestrator — Central coordinator for the JAKU multi-agent system.
@@ -86,9 +85,6 @@ export class Orchestrator {
 
         // Execute in dependency-resolved waves
         for (const wave of executionOrder) {
-            // Fix 4: Session heartbeat — re-authenticate if session expired before each wave
-            await this._checkSessionHealth();
-
             if (wave.length === 1) {
                 // Single agent — run sequentially
                 await this._runAgent(wave[0]);
@@ -122,9 +118,6 @@ export class Orchestrator {
                 this.logger?.debug?.(`Cleanup for ${agent.name}: ${err.message}`);
             }
         }
-
-        // Fix 2: Ensure all browsers are closed via BrowserManager
-        await BrowserManager.closeAll().catch(() => { });
 
         // Synthesis phase
         const duration = Date.now() - this._startTime;
@@ -262,7 +255,7 @@ export class Orchestrator {
         try {
             const payload = {
                 agent: 'JAKU',
-                version: '1.0.0',
+                version: '1.0.1',
                 target: this.config.target_url,
                 timestamp: new Date().toISOString(),
                 duration: results.duration,
@@ -285,39 +278,6 @@ export class Orchestrator {
             this.logger?.warn?.(`Webhook notification failed: ${err.message}`);
         }
     }
-    /**
-     * Fix 4: Session heartbeat — check if auth session is still valid.
-     * If the target returns 401/403, attempt re-authentication.
-     */
-    async _checkSessionHealth() {
-        const authManager = this.config._authManager;
-        if (!authManager?.isAuthenticated) return; // No auth, nothing to check
-
-        const targetUrl = this.config.target_url;
-
-        try {
-            const resp = await fetch(targetUrl, {
-                method: 'HEAD',
-                signal: AbortSignal.timeout(5000),
-                redirect: 'follow',
-            });
-
-            if (resp.status === 401 || resp.status === 403) {
-                this.logger?.warn?.('⚠ Session appears expired — re-authenticating...');
-                try {
-                    await authManager.authenticate();
-                    // Update the shared context with refreshed auth state
-                    this._sharedContext.config._authManager = authManager;
-                    this.logger?.info?.('✔ Re-authentication successful');
-                } catch (err) {
-                    this.logger?.error?.(`Re-authentication failed: ${err.message}`);
-                }
-            }
-        } catch {
-            // Network error — skip heartbeat silently
-        }
-    }
-
 }
 
 export default Orchestrator;

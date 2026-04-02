@@ -93,9 +93,6 @@ export class InfraScanner {
      * Probe known sensitive/admin endpoints.
      */
     async _probeEndpoints(baseUrl) {
-        // Fetch baseline fingerprint to detect SPA catch-all routes
-        const baseline = await this._fetchBaselineFingerprint(baseUrl);
-
         const results = await Promise.allSettled(
             InfraScanner.PROBE_PATHS.map(async ({ path, desc, severity }) => {
                 const url = new URL(path, baseUrl).toString();
@@ -109,15 +106,6 @@ export class InfraScanner {
                     if (resp.ok && resp.status === 200) {
                         const contentType = resp.headers.get('content-type') || '';
                         const body = await resp.text();
-
-                        // Skip if response matches the catch-all baseline (SPA serving same page for all routes)
-                        if (baseline.isCatchAll) {
-                            const probeHash = this._computeContentHash(body);
-                            if (probeHash === baseline.catchAllHash) return null;
-                            // Fuzzy match: if body length is within 5% of baseline and it's HTML, likely same page with minor variations
-                            const lengthRatio = Math.abs(body.length - baseline.catchAllLength) / Math.max(baseline.catchAllLength, 1);
-                            if (lengthRatio < 0.05 && contentType.includes('text/html')) return null;
-                        }
 
                         // Skip if it's a generic 200 HTML page (SPA catch-all)
                         if (this._isGenericSPAPage(body, path)) return null;
@@ -292,99 +280,21 @@ export class InfraScanner {
     _isGenericSPAPage(body, path) {
         // SPAs often serve the same index.html for all routes
         if (!body.includes('<!DOCTYPE html') && !body.includes('<!doctype html')) return false;
-
-        // Broad set of SPA framework markers
-        const spaMarkers = [
-            'id="root"', 'id="app"', 'id="__next"', 'id="__nuxt"', 'id="__gatsby"',
-            'id="svelte"', 'id="__svelte"', 'data-reactroot', 'ng-app', 'ng-version',
-            'data-server-rendered', 'id="q-app"',  // Qwik
-            '_buildManifest.js', '_ssgManifest.js', // Next.js build artifacts
-        ];
-
-        return spaMarkers.some(marker => body.includes(marker));
+        // Check if it looks like a generic app shell (no path-specific content)
+        if (body.includes('id="root"') || body.includes('id="app"') || body.includes('id="__next"')) {
+            // Likely a SPA — check if the path text doesn't appear in the body
+            const pathName = path.replace(/[/._-]/g, '');
+            return !body.toLowerCase().includes(pathName.toLowerCase());
+        }
+        return false;
     }
 
-    /**
-     * Check if a response body contains actual sensitive data (not just HTML form labels).
-     */
     _containsSensitiveData(body) {
-        // Patterns that indicate real sensitive data exposure (not normal HTML content)
         const sensitivePatterns = [
-            /DB_HOST\s*[=:]/i,                        // Env variable assignment
-            /DB_PASSWORD\s*[=:]/i,                     // Env variable
-            /DATABASE_URL\s*[=:]/i,                    // Env variable
-            /["']?password["']?\s*[:=]\s*["'][^"']+["']/i,  // Key-value with actual password value
-            /["']?secret["']?\s*[:=]\s*["'][^"']+["']/i,    // Key-value with actual secret value
-            /private.key/i,                            // Private key file reference
-            /-----BEGIN (RSA |EC )?PRIVATE KEY-----/,  // Actual private key content
-            /access.token\s*[=:]\s*["']?[A-Za-z0-9._\-]{20,}/i,  // Actual token value
-            /api[_-]?key\s*[=:]\s*["']?[A-Za-z0-9._\-]{16,}/i,    // Actual API key value
-            /AKIA[0-9A-Z]{16}/,                        // AWS access key
+            /password/i, /secret/i, /private.*key/i, /access.*token/i,
+            /database/i, /DB_HOST/i, /api.?key/i,
         ];
         return sensitivePatterns.some(p => p.test(body));
-    }
-
-    /**
-     * Fetch baseline fingerprint to detect SPA catch-all routes.
-     * Compares the homepage response with a random nonsense path.
-     * If both return the same content, the site uses a catch-all.
-     */
-    async _fetchBaselineFingerprint(baseUrl) {
-        const result = { isCatchAll: false, catchAllHash: null, catchAllLength: 0 };
-
-        try {
-            const randomPath = `/jaku-fp-check-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-            const [homeResp, randomResp] = await Promise.all([
-                fetch(new URL('/', baseUrl).toString(), {
-                    method: 'GET', redirect: 'follow', signal: AbortSignal.timeout(10000),
-                }).catch(() => null),
-                fetch(new URL(randomPath, baseUrl).toString(), {
-                    method: 'GET', redirect: 'follow', signal: AbortSignal.timeout(10000),
-                }).catch(() => null),
-            ]);
-
-            if (!homeResp?.ok || !randomResp?.ok) return result;
-
-            const homeBody = await homeResp.text();
-            const randomBody = await randomResp.text();
-
-            const homeHash = this._computeContentHash(homeBody);
-            const randomHash = this._computeContentHash(randomBody);
-
-            if (homeHash === randomHash) {
-                result.isCatchAll = true;
-                result.catchAllHash = homeHash;
-                result.catchAllLength = homeBody.length;
-                this.logger?.info?.('Detected SPA catch-all route — baseline fingerprint will filter false positives');
-            }
-        } catch {
-            // Fingerprinting failed, proceed without baseline
-        }
-
-        return result;
-    }
-
-    /**
-     * Compute a simple content hash for comparing page bodies.
-     * Strips dynamic tokens (nonces, timestamps, CSRF tokens) for stable comparison.
-     */
-    _computeContentHash(body) {
-        // Normalize: strip nonces, CSRF tokens, timestamps, and whitespace variations
-        const normalized = body
-            .replace(/nonce="[^"]*"/g, 'nonce=""')
-            .replace(/csrf[_-]?token["']?\s*[:=]\s*["'][^"']*["']/gi, 'csrf_token=""')
-            .replace(/\b\d{13,}\b/g, '0')            // Unix timestamps (milliseconds)
-            .replace(/[a-f0-9]{32,}/gi, 'HASH')       // Long hex strings (session IDs, hashes)
-            .replace(/\s+/g, ' ')
-            .trim();
-
-        // Simple DJB2 hash — fast and sufficient for content comparison
-        let hash = 5381;
-        for (let i = 0; i < normalized.length; i++) {
-            hash = ((hash << 5) + hash + normalized.charCodeAt(i)) | 0;
-        }
-        return hash;
     }
 }
 

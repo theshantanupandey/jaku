@@ -2,7 +2,6 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
-import fs from 'fs';
 import { loadConfig } from './utils/config.js';
 import { createLogger } from './utils/logger.js';
 import { Orchestrator } from './agents/orchestrator.js';
@@ -18,7 +17,7 @@ import { AuthManager } from './core/auth-manager.js';
 const BANNER = `
 ${chalk.hex('#00ff88').bold('  ╦╔═╗╦╔═╦ ╦')}
 ${chalk.hex('#00ff88').bold('  ║╠═╣╠╩╗║ ║')}  ${chalk.dim('呪 Autonomous Security & Quality Intelligence')}
-${chalk.hex('#00ff88').bold(' ╚╝╩ ╩╩ ╩╚═╝')}  ${chalk.dim('v1.0.0 · Multi-Agent')}
+${chalk.hex('#00ff88').bold(' ╚╝╩ ╩╩ ╩╚═╝')}  ${chalk.dim('v1.0.1 · Multi-Agent')}
 `;
 
 const program = new Command();
@@ -26,7 +25,7 @@ const program = new Command();
 program
     .name('jaku')
     .description('JAKU (呪) — Autonomous QA & Security scanning agent for vibe-coded apps')
-    .version('1.0.0');
+    .version('1.0.1');
 
 // ═══════════════════════════════════════════════
 // Multi-Agent Scan Runner
@@ -37,11 +36,15 @@ async function runScan(url, options, modulesToRun) {
 
     const config = loadConfig({ ...options, targetUrl: url });
     config.target_url = url;
-    config.crawler = {
-        ...config.crawler,
-        max_pages: parseInt(options.maxPages) || config.crawler?.max_pages || 50,
-        max_depth: parseInt(options.maxDepth) || config.crawler?.max_depth || 5,
-    };
+
+    // CLI --max-pages / --max-depth override profile settings only when explicitly set
+    // (Commander gives us the string defaults, so we check against those)
+    if (options.maxPages && options.maxPages !== '50') {
+        config.crawler.max_pages = parseInt(options.maxPages);
+    }
+    if (options.maxDepth && options.maxDepth !== '5') {
+        config.crawler.max_depth = parseInt(options.maxDepth);
+    }
 
     // Propagate CLI flags to config
     if (options.haltOnCritical) config.halt_on_critical = true;
@@ -107,6 +110,11 @@ async function runScan(url, options, modulesToRun) {
 
     if (authManager.isAuthenticated) {
         authSpinner.succeed(chalk.dim('Authenticated: ') + authManager.roles.map(r => chalk.hex('#00ff88')(r)).join(', '));
+    } else if (authManager.loginFormInfo) {
+        const info = authManager.loginFormInfo;
+        const typeLabel = { phone: '📱 Phone/OTP', otp: '🔢 OTP', social: '🔗 Social/OAuth', email: '📧 Email', password: '🔑 Password' }[info.type] || info.type;
+        const locationLabel = info.isModal ? 'modal' : 'page';
+        authSpinner.info(chalk.dim(`Login detected (${typeLabel} via ${locationLabel}) — scanning unauthenticated`));
     } else {
         authSpinner.info(chalk.dim('No credentials — scanning unauthenticated'));
     }
@@ -212,8 +220,6 @@ async function runScan(url, options, modulesToRun) {
             findings: results.findings,
             deduplicated: results.deduplicated,
             dedupStats: results.dedupStats,
-            correlations: results.correlations || [],
-            modules: modulesToRun,
             testSummary: { ...testSummary, duration },
             surfaceInventory: results.surfaceInventory,
             outputDir: config.output_dir,
@@ -280,31 +286,6 @@ async function runScan(url, options, modulesToRun) {
 }
 
 // ═══════════════════════════════════════════════
-// Fix 7: Multi-target URL resolver
-// ═══════════════════════════════════════════════
-
-/**
- * Resolve target URLs from either a primary URL, a comma-separated list (--targets),
- * or a file path (one URL per line).
- */
-function _resolveTargets(primaryUrl, targetsOption) {
-    if (!targetsOption) return [primaryUrl];
-
-    // Check if it looks like a file path
-    if (fs.existsSync(targetsOption)) {
-        const lines = fs.readFileSync(targetsOption, 'utf-8')
-            .split('\n')
-            .map(l => l.trim())
-            .filter(l => l && l.startsWith('http'));
-        return lines.length > 0 ? lines : [primaryUrl];
-    }
-
-    // Comma-separated list
-    const targets = targetsOption.split(',').map(t => t.trim()).filter(t => t.startsWith('http'));
-    return targets.length > 0 ? targets : [primaryUrl];
-}
-
-// ═══════════════════════════════════════════════
 // Commands
 // ═══════════════════════════════════════════════
 
@@ -316,7 +297,7 @@ program
     .option('-o, --output <dir>', 'Output directory for reports')
     .option('-m, --modules <list>', 'Comma-separated modules to run (qa,security,ai,logic,api)', 'qa,security,ai,logic,api')
     .option('-s, --severity <level>', 'Minimum severity threshold (critical|high|medium|low)', 'low')
-    .option('--targets <urls-or-file>', 'Comma-separated target URLs or path to a file with one URL per line (multi-target mode)')
+    .option('--profile <type>', 'Scan profile: quick|deep|ci (overrides crawl settings)')
     .option('--json', 'Output JSON report')
     .option('--html', 'Output HTML report')
     .option('--max-pages <n>', 'Maximum pages to crawl', '50')
@@ -331,23 +312,7 @@ program
     .option('-v, --verbose', 'Enable verbose logging')
     .action(async (url, options) => {
         const modules = options.modules.split(',').map(m => m.trim().toLowerCase());
-
-        // Fix 7: Multi-target support — parse --targets flag
-        const targets = _resolveTargets(url, options.targets);
-
-        if (targets.length === 1) {
-            await runScan(targets[0], options, modules);
-        } else {
-            console.log(chalk.hex('#00ff88').bold(`\n  ═══ MULTI-TARGET SCAN: ${targets.length} targets ═══\n`));
-            for (let i = 0; i < targets.length; i++) {
-                const target = targets[i];
-                console.log(chalk.hex('#00ff88').bold(`\n  ── Target ${i + 1}/${targets.length}: ${target} ──\n`));
-                await runScan(target, options, modules).catch(err => {
-                    console.error(chalk.red(`  ✘ Scan failed for ${target}: ${err.message}`));
-                });
-            }
-            console.log(chalk.hex('#00ff88').bold(`\n  ═══ MULTI-TARGET SCAN COMPLETE ═══\n`));
-        }
+        await runScan(url, options, modules);
     });
 
 program

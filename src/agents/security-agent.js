@@ -7,28 +7,23 @@ import { DependencyAuditor } from '../core/security/dependency-auditor.js';
 import { TLSChecker } from '../core/security/tls-checker.js';
 import { InfraScanner } from '../core/security/infra-scanner.js';
 import { FileUploadTester } from '../core/security/file-upload-tester.js';
-import { CORSProber } from '../core/security/cors-prober.js';
-import { CSRFProber } from '../core/security/csrf-prober.js';
-import { PrototypePollutionScanner } from '../core/security/prototype-pollution.js';
-import { PathTraversalScanner } from '../core/security/path-traversal.js';
+import { CSRFDetector } from '../core/security/csrf-detector.js';
+import { OpenRedirectDetector } from '../core/security/open-redirect-detector.js';
+import { SubdomainScanner } from '../core/security/subdomain-scanner.js';
+import { CookieAuditor } from '../core/security/cookie-auditor.js';
+import { CSPValidator } from '../core/security/csp-validator.js';
+import { ClickjackingDetector } from '../core/security/clickjacking-detector.js';
+import { SSRFProber } from '../core/security/ssrf-prober.js';
 
 /**
  * JAKU-SEC — Security Vulnerability Scanning Agent
- *
- * Pipeline (12 phases):
- * 1. Header Analysis      — CSP, HSTS, X-Frame-Options, etc.
- * 2. Secret Detection     — API keys, tokens, credentials in JS/HTML
- * 3. XSS Scanning         — Reflected, stored, DOM, AngularJS/Vue template injection
- * 4. SQL Injection         — Error-based, boolean-based, time-based
- * 5. Dependency Audit     — CVE lookup for npm/pip/gem packages
- * 6. TLS Check            — Protocol version, cipher strength, cert validity
- * 7. Infrastructure Scan  — Open ports, service disclosure, misconfigured services
- * 8. File Upload Testing  — MIME bypass, polyglot files, path traversal in upload
- * 9. CORS Probing         — Arbitrary origin reflection, null origin, pre-flight bypass
- * 10. CSRF Probing        — Cookie SameSite, token absence, state-changing GET
- * 11. Prototype Pollution — __proto__ and constructor.prototype injection via URL/JSON
- * 12. Path Traversal / LFI — ../ variants, encoding bypasses, cloud metadata SSRF
- *
+ * 
+ * Runs all Module 02 sub-modules against the surface inventory:
+ * Header Analysis → Secret Detection → XSS Scanning → SQL Injection Probing →
+ * Dependency Audit → TLS Check → Infrastructure Scan → File Upload →
+ * CSRF Detection → Open Redirect Detection → Subdomain Enumeration →
+ * Cookie Audit → CSP Validation → Clickjacking Detection → SSRF Probing
+ * 
  * Dependencies: JAKU-CRAWL
  */
 export class SecurityAgent extends BaseAgent {
@@ -51,10 +46,13 @@ export class SecurityAgent extends BaseAgent {
             { name: 'tls', label: 'Checking TLS configuration' },
             { name: 'infra', label: 'Scanning infrastructure' },
             { name: 'upload', label: 'Testing file upload security' },
-            { name: 'cors', label: 'Probing CORS misconfigurations' },
-            { name: 'csrf', label: 'Testing CSRF protection' },
-            { name: 'proto', label: 'Scanning for prototype pollution' },
-            { name: 'traversal', label: 'Testing path traversal / LFI' },
+            { name: 'csrf', label: 'Detecting missing CSRF protection' },
+            { name: 'redirect', label: 'Probing for open redirects' },
+            { name: 'subdomains', label: 'Enumerating subdomains' },
+            { name: 'cookies', label: 'Auditing cookie security' },
+            { name: 'csp', label: 'Validating Content Security Policy' },
+            { name: 'clickjacking', label: 'Detecting clickjacking vulnerabilities' },
+            { name: 'ssrf', label: 'Probing for SSRF vulnerabilities' },
         ];
 
         let completedPhases = 0;
@@ -156,51 +154,87 @@ export class SecurityAgent extends BaseAgent {
         }
         completedPhases++;
 
-        // Phase 9: CORS Probing
+        // Phase 9: CSRF Detection
         this.progress(phases[8].name, phases[8].label, (completedPhases / phases.length) * 100);
         try {
-            const corsProber = new CORSProber(logger);
-            const findings = await corsProber.probe(surfaceInventory);
-            this.addFindings(findings);
-            this._log(`CORS: ${findings.length} misconfigurations`);
-        } catch (err) {
-            this._log(`CORS probing failed: ${err.message}`, 'error');
-        }
-        completedPhases++;
-
-        // Phase 10: CSRF Probing
-        this.progress(phases[9].name, phases[9].label, (completedPhases / phases.length) * 100);
-        try {
-            const csrfProber = new CSRFProber(logger);
-            const findings = await csrfProber.probe(surfaceInventory);
+            const detector = new CSRFDetector(logger);
+            const findings = await detector.detect(surfaceInventory);
             this.addFindings(findings);
             this._log(`CSRF: ${findings.length} issues`);
         } catch (err) {
-            this._log(`CSRF probing failed: ${err.message}`, 'error');
+            this._log(`CSRF detection failed: ${err.message}`, 'error');
         }
         completedPhases++;
 
-        // Phase 11: Prototype Pollution
+        // Phase 10: Open Redirect Detection
+        this.progress(phases[9].name, phases[9].label, (completedPhases / phases.length) * 100);
+        try {
+            const detector = new OpenRedirectDetector(logger);
+            const findings = await detector.detect(surfaceInventory);
+            this.addFindings(findings);
+            this._log(`Open redirects: ${findings.length} issues`);
+        } catch (err) {
+            this._log(`Open redirect detection failed: ${err.message}`, 'error');
+        }
+        completedPhases++;
+
+        // Phase 11: Subdomain Enumeration
         this.progress(phases[10].name, phases[10].label, (completedPhases / phases.length) * 100);
         try {
-            const ppScanner = new PrototypePollutionScanner(logger);
-            const findings = await ppScanner.scan(surfaceInventory);
+            const scanner = new SubdomainScanner(logger);
+            const findings = await scanner.scan(surfaceInventory);
             this.addFindings(findings);
-            this._log(`Prototype pollution: ${findings.length} issues`);
+            this._log(`Subdomains: ${findings.length} findings`);
         } catch (err) {
-            this._log(`Prototype pollution scan failed: ${err.message}`, 'error');
+            this._log(`Subdomain scanning failed: ${err.message}`, 'error');
         }
         completedPhases++;
 
-        // Phase 12: Path Traversal / LFI
+        // Phase 12: Cookie Security Audit
         this.progress(phases[11].name, phases[11].label, (completedPhases / phases.length) * 100);
         try {
-            const traversalScanner = new PathTraversalScanner(logger);
-            const findings = await traversalScanner.scan(surfaceInventory);
+            const auditor = new CookieAuditor(logger);
+            const findings = await auditor.audit(surfaceInventory);
             this.addFindings(findings);
-            this._log(`Path traversal: ${findings.length} issues`);
+            this._log(`Cookies: ${findings.length} issues`);
         } catch (err) {
-            this._log(`Path traversal scan failed: ${err.message}`, 'error');
+            this._log(`Cookie audit failed: ${err.message}`, 'error');
+        }
+        completedPhases++;
+
+        // Phase 13: CSP Validation
+        this.progress(phases[12].name, phases[12].label, (completedPhases / phases.length) * 100);
+        try {
+            const validator = new CSPValidator(logger);
+            const findings = await validator.validate(surfaceInventory);
+            this.addFindings(findings);
+            this._log(`CSP: ${findings.length} issues`);
+        } catch (err) {
+            this._log(`CSP validation failed: ${err.message}`, 'error');
+        }
+        completedPhases++;
+
+        // Phase 14: Clickjacking Detection
+        this.progress(phases[13].name, phases[13].label, (completedPhases / phases.length) * 100);
+        try {
+            const detector = new ClickjackingDetector(logger);
+            const findings = await detector.detect(surfaceInventory);
+            this.addFindings(findings);
+            this._log(`Clickjacking: ${findings.length} issues`);
+        } catch (err) {
+            this._log(`Clickjacking detection failed: ${err.message}`, 'error');
+        }
+        completedPhases++;
+
+        // Phase 15: SSRF Probing
+        this.progress(phases[14].name, phases[14].label, (completedPhases / phases.length) * 100);
+        try {
+            const prober = new SSRFProber(logger);
+            const findings = await prober.probe(surfaceInventory);
+            this.addFindings(findings);
+            this._log(`SSRF: ${findings.length} issues`);
+        } catch (err) {
+            this._log(`SSRF probing failed: ${err.message}`, 'error');
         }
         completedPhases++;
 
@@ -209,3 +243,4 @@ export class SecurityAgent extends BaseAgent {
 }
 
 export default SecurityAgent;
+

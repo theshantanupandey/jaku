@@ -5,21 +5,14 @@ import { TestGenerator } from '../core/test-generator.js';
 import { TestRunner } from '../core/test-runner.js';
 import { FormValidator } from '../core/form-validator.js';
 import { ResponsiveChecker } from '../core/responsive-checker.js';
-import { PerformanceChecker } from '../core/performance-checker.js';
-import { AccessibilityChecker } from '../core/accessibility-checker.js';
 
 /**
  * JAKU-QA — Quality Assurance & Functional Testing Agent
- *
- * Pipeline (7 phases):
- * 1. Broken Flow Detection  — 404s, redirect loops, missing auth redirects
- * 2. Console Monitoring     — JS errors, unhandled promises, network failures
- * 3. Test Generation & Run  — Smoke tests per discovered page with deduplication
- * 4. Form Validation        — Required fields, type checking, error messaging
- * 5. Responsive Checking    — Mobile/tablet/desktop layout issues
- * 6. Performance Checking   — Core Web Vitals: LCP, FCP, TTFB, TBT, CLS
- * 7. Accessibility Checking — WCAG 2.2 via axe-core (real-browser injection)
- *
+ * 
+ * Runs all Module 01 sub-modules against the surface inventory:
+ * Broken Flow Detection → Console Monitoring → Test Generation & Execution →
+ * Form Validation → Responsive Checking
+ * 
  * Dependencies: JAKU-CRAWL
  */
 export class QAAgent extends BaseAgent {
@@ -46,8 +39,6 @@ export class QAAgent extends BaseAgent {
             { name: 'tests', label: 'Generating & running tests' },
             { name: 'forms', label: 'Validating forms' },
             { name: 'responsive', label: 'Checking responsiveness' },
-            { name: 'performance', label: 'Measuring Core Web Vitals' },
-            { name: 'accessibility', label: 'Checking WCAG 2.2 accessibility' },
         ];
 
         let completedPhases = 0;
@@ -115,30 +106,6 @@ export class QAAgent extends BaseAgent {
             this._log(`Responsive: ${findings.length} issues`);
         } catch (err) {
             this._log(`Responsive check failed: ${err.message}`, 'error');
-        }
-        completedPhases++;
-
-        // Phase 6: Performance Checking — Core Web Vitals
-        this.progress(phases[5].name, phases[5].label, (completedPhases / phases.length) * 100);
-        try {
-            const perfChecker = new PerformanceChecker(config, logger);
-            const findings = await perfChecker.check(surfaceInventory);
-            this.addFindings(findings);
-            this._log(`Performance: ${findings.length} issues`);
-        } catch (err) {
-            this._log(`Performance checking failed: ${err.message}`, 'error');
-        }
-        completedPhases++;
-
-        // Phase 7: Accessibility Checking — WCAG 2.2 / axe-core
-        this.progress(phases[6].name, phases[6].label, (completedPhases / phases.length) * 100);
-        try {
-            const a11yChecker = new AccessibilityChecker(config, logger);
-            const findings = await a11yChecker.check(surfaceInventory);
-            this.addFindings(findings);
-            this._log(`Accessibility: ${findings.length} issues`);
-        } catch (err) {
-            this._log(`Accessibility checking failed: ${err.message}`, 'error');
         }
         completedPhases++;
 

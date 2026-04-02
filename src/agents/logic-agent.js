@@ -5,21 +5,27 @@ import { AccessBoundaryTester } from '../core/logic/access-boundary-tester.js';
 import { WorkflowEnforcer } from '../core/logic/workflow-enforcer.js';
 import { RaceConditionDetector } from '../core/logic/race-condition-detector.js';
 import { AbusePatternScanner } from '../core/logic/abuse-pattern-scanner.js';
-import { GraphQLAuditor } from '../core/logic/graphql-auditor.js';
-import { ParameterPolluter } from '../core/logic/parameter-polluter.js';
+import { CouponAbuseTester } from '../core/logic/coupon-abuse-tester.js';
+import { CartManipulationTester } from '../core/logic/cart-manipulation-tester.js';
+import { EmailEnumerationTester } from '../core/logic/email-enumeration-tester.js';
+import { AccountTakeoverTester } from '../core/logic/account-takeover-tester.js';
+import { FeatureFlagBypassTester } from '../core/logic/feature-flag-bypass-tester.js';
 
 /**
  * JAKU-LOGIC — Business Logic Validation Agent
  *
- * Pipeline (8 phases):
+ * Pipeline:
  * 1. Infer business rules from surface inventory
  * 2. Test pricing/payment manipulation
- * 3. Test access control boundaries (IDOR, JWT sub, cross-tenant, UUID enumeration)
- * 4. Test workflow enforcement (step skipping, resubmission, invalid transitions)
- * 5. Test race conditions (double spend, TOCTOU, inventory oversell)
- * 6. Test abuse patterns (referral, reward, subscription farming)
- * 7. GraphQL security audit (introspection, batch, depth, aliases, field suggestions)
- * 8. HTTP parameter pollution (duplication, injection, verb tampering)
+ * 3. Test access control boundaries (IDOR, escalation)
+ * 4. Test workflow enforcement (step skipping, resubmission)
+ * 5. Test race conditions (double spend, TOCTOU)
+ * 6. Test abuse patterns (referral, reward, subscription)
+ * 7. Test coupon/promo abuse (stacking, reuse, expired)
+ * 8. Test cart manipulation (negative qty, price tampering)
+ * 9. Test email enumeration (login/register/reset forms)
+ * 10. Test account takeover flows (password reset, email change, session)
+ * 11. Test feature flag bypass (client-side gating)
  *
  * Dependencies: JAKU-CRAWL (runs in Wave 2, parallel with QA + SEC + AI)
  */
@@ -45,7 +51,7 @@ export class LogicAgent extends BaseAgent {
             .map(([domain]) => domain);
 
         this._log(`Inferred ${activeDomains.length} business domains: ${activeDomains.join(', ') || 'none'}`);
-        this.progress('infer', `Found ${activeDomains.length} business domains`, 10);
+        this.progress('infer', `Found ${activeDomains.length} business domains`, 5);
 
         if (activeDomains.length === 0) {
             this._log('No business logic surfaces detected — skipping logic tests');
@@ -53,8 +59,11 @@ export class LogicAgent extends BaseAgent {
             return;
         }
 
+        const totalPhases = 11;
+        let completed = 1;
+
         // Phase 2: Pricing exploitation
-        this.progress('pricing', 'Testing pricing & payment logic...', 10);
+        this.progress('pricing', 'Testing pricing & payment logic...', (completed / totalPhases) * 100);
         try {
             const exploiter = new PricingExploiter(logger);
             const pricingFindings = await exploiter.exploit(businessContext);
@@ -63,10 +72,10 @@ export class LogicAgent extends BaseAgent {
         } catch (err) {
             this._log(`Pricing testing failed: ${err.message}`, 'error');
         }
-        this.progress('pricing', 'Pricing testing complete', 25);
+        completed++;
 
         // Phase 3: Access boundary testing
-        this.progress('access', 'Testing access control boundaries...', 25);
+        this.progress('access', 'Testing access control boundaries...', (completed / totalPhases) * 100);
         try {
             const tester = new AccessBoundaryTester(logger);
             const accessFindings = await tester.test(businessContext, surfaceInventory);
@@ -75,10 +84,10 @@ export class LogicAgent extends BaseAgent {
         } catch (err) {
             this._log(`Access boundary testing failed: ${err.message}`, 'error');
         }
-        this.progress('access', 'Access boundary testing complete', 45);
+        completed++;
 
         // Phase 4: Workflow enforcement
-        this.progress('workflow', 'Testing workflow enforcement...', 45);
+        this.progress('workflow', 'Testing workflow enforcement...', (completed / totalPhases) * 100);
         try {
             const enforcer = new WorkflowEnforcer(logger);
             const workflowFindings = await enforcer.enforce(businessContext, surfaceInventory);
@@ -87,10 +96,10 @@ export class LogicAgent extends BaseAgent {
         } catch (err) {
             this._log(`Workflow testing failed: ${err.message}`, 'error');
         }
-        this.progress('workflow', 'Workflow testing complete', 65);
+        completed++;
 
         // Phase 5: Race condition detection
-        this.progress('race', 'Testing for race conditions...', 65);
+        this.progress('race', 'Testing for race conditions...', (completed / totalPhases) * 100);
         try {
             const detector = new RaceConditionDetector(logger);
             const raceFindings = await detector.detect(businessContext, surfaceInventory);
@@ -99,10 +108,10 @@ export class LogicAgent extends BaseAgent {
         } catch (err) {
             this._log(`Race condition testing failed: ${err.message}`, 'error');
         }
-        this.progress('race', 'Race condition testing complete', 85);
+        completed++;
 
         // Phase 6: Abuse pattern scanning
-        this.progress('abuse', 'Scanning for abuse patterns...', 85);
+        this.progress('abuse', 'Scanning for abuse patterns...', (completed / totalPhases) * 100);
         try {
             const scanner = new AbusePatternScanner(logger);
             const abuseFindings = await scanner.scan(businessContext, surfaceInventory);
@@ -111,34 +120,71 @@ export class LogicAgent extends BaseAgent {
         } catch (err) {
             this._log(`Abuse pattern scanning failed: ${err.message}`, 'error');
         }
-        this.progress('abuse', 'Abuse pattern scanning complete', 85);
+        completed++;
 
-        // Phase 7: GraphQL Security Audit
-        this.progress('graphql', 'Auditing GraphQL endpoints...', 85);
+        // Phase 7: Coupon/promo abuse testing
+        this.progress('coupon', 'Testing for coupon/promo abuse...', (completed / totalPhases) * 100);
         try {
-            const gqlAuditor = new GraphQLAuditor(logger);
-            const gqlFindings = await gqlAuditor.audit(surfaceInventory);
-            this.addFindings(gqlFindings);
-            this._log(`GraphQL: ${gqlFindings.length} issues`);
+            const tester = new CouponAbuseTester(logger);
+            const couponFindings = await tester.test(businessContext, surfaceInventory);
+            this.addFindings(couponFindings);
+            this._log(`Coupon abuse: ${couponFindings.length} issues`);
         } catch (err) {
-            this._log(`GraphQL audit failed: ${err.message}`, 'error');
+            this._log(`Coupon abuse testing failed: ${err.message}`, 'error');
         }
-        this.progress('graphql', 'GraphQL audit complete', 92);
+        completed++;
 
-        // Phase 8: HTTP Parameter Pollution
-        this.progress('hpp', 'Testing HTTP parameter pollution...', 92);
+        // Phase 8: Cart manipulation testing
+        this.progress('cart', 'Testing for cart manipulation...', (completed / totalPhases) * 100);
         try {
-            const polluter = new ParameterPolluter(logger);
-            const hppFindings = await polluter.pollute(businessContext, surfaceInventory);
-            this.addFindings(hppFindings);
-            this._log(`Parameter pollution: ${hppFindings.length} issues`);
+            const tester = new CartManipulationTester(logger);
+            const cartFindings = await tester.test(businessContext, surfaceInventory);
+            this.addFindings(cartFindings);
+            this._log(`Cart manipulation: ${cartFindings.length} issues`);
         } catch (err) {
-            this._log(`Parameter pollution testing failed: ${err.message}`, 'error');
+            this._log(`Cart manipulation testing failed: ${err.message}`, 'error');
         }
-        this.progress('hpp', 'Parameter pollution testing complete', 100);
+        completed++;
+
+        // Phase 9: Email enumeration testing
+        this.progress('email-enum', 'Testing for email enumeration...', (completed / totalPhases) * 100);
+        try {
+            const tester = new EmailEnumerationTester(logger);
+            const emailFindings = await tester.test(businessContext, surfaceInventory);
+            this.addFindings(emailFindings);
+            this._log(`Email enumeration: ${emailFindings.length} issues`);
+        } catch (err) {
+            this._log(`Email enumeration testing failed: ${err.message}`, 'error');
+        }
+        completed++;
+
+        // Phase 10: Account takeover testing
+        this.progress('account-takeover', 'Testing account takeover flows...', (completed / totalPhases) * 100);
+        try {
+            const tester = new AccountTakeoverTester(logger);
+            const atoFindings = await tester.test(businessContext, surfaceInventory);
+            this.addFindings(atoFindings);
+            this._log(`Account takeover: ${atoFindings.length} issues`);
+        } catch (err) {
+            this._log(`Account takeover testing failed: ${err.message}`, 'error');
+        }
+        completed++;
+
+        // Phase 11: Feature flag bypass testing
+        this.progress('feature-flags', 'Testing for feature flag bypass...', (completed / totalPhases) * 100);
+        try {
+            const tester = new FeatureFlagBypassTester(logger);
+            const flagFindings = await tester.test(businessContext, surfaceInventory);
+            this.addFindings(flagFindings);
+            this._log(`Feature flag bypass: ${flagFindings.length} issues`);
+        } catch (err) {
+            this._log(`Feature flag bypass testing failed: ${err.message}`, 'error');
+        }
+        completed++;
 
         this.progress('complete', `Logic scan complete — ${this._findings.length} total findings`, 100);
     }
 }
 
 export default LogicAgent;
+

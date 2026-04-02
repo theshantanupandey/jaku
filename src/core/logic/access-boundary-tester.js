@@ -5,12 +5,10 @@ import { createFinding } from '../../utils/finding.js';
  *
  * Probes:
  * - Horizontal IDOR (access other users' resources by changing ID)
- * - UUID/GUID enumeration (sequential UUID prediction and fuzzing)
- * - JWT sub-claim manipulation (change user_id in JWT payload)
- * - Cross-tenant access (change org_id, tenant_id, workspace_id)
  * - Vertical escalation (access admin from unprivileged context)
  * - Guest access (perform auth-required actions without login)
  * - Free-to-paid bypass (access premium features without subscription)
+ * - Direct object reference enumeration
  */
 export class AccessBoundaryTester {
     constructor(logger) {
@@ -48,23 +46,15 @@ export class AccessBoundaryTester {
         const verticalFindings = await this._testVerticalEscalation(surfaceInventory);
         findings.push(...verticalFindings);
 
-        // 2. Test IDOR on API endpoints (numeric IDs)
+        // 2. Test IDOR on API endpoints
         const idorFindings = await this._testIDOR(businessContext, surfaceInventory);
         findings.push(...idorFindings);
 
-        // 3. Test UUID-based IDOR
-        const uuidFindings = await this._testUUIDIDOR(surfaceInventory);
-        findings.push(...uuidFindings);
-
-        // 4. Test cross-tenant access
-        const crossTenantFindings = await this._testCrossTenantAccess(surfaceInventory);
-        findings.push(...crossTenantFindings);
-
-        // 5. Test free-to-paid bypass
+        // 3. Test free-to-paid bypass
         const premiumFindings = await this._testPremiumBypass(surfaceInventory);
         findings.push(...premiumFindings);
 
-        // 6. Test guest access to authenticated routes
+        // 4. Test guest access to authenticated routes
         const guestFindings = await this._testGuestAccess(businessContext);
         findings.push(...guestFindings);
 
@@ -123,7 +113,6 @@ export class AccessBoundaryTester {
 
     /**
      * Test IDOR — can resource IDs be manipulated to access other users' data?
-     * Handles numeric IDs with enumeration.
      */
     async _testIDOR(businessContext, surfaceInventory) {
         const findings = [];
@@ -140,10 +129,8 @@ export class AccessBoundaryTester {
             const testIds = [
                 String(parseInt(originalId) + 1),
                 String(parseInt(originalId) - 1),
-                String(parseInt(originalId) + 100),
                 '1',
                 '0',
-                '-1',
             ];
 
             for (const testId of testIds) {
@@ -165,152 +152,23 @@ export class AccessBoundaryTester {
                         if (text.length > 50 && !this._isGenericResponse(text)) {
                             findings.push(createFinding({
                                 module: 'logic',
-                                title: 'IDOR: Insecure Direct Object Reference (Numeric ID)',
+                                title: 'IDOR: Insecure Direct Object Reference',
                                 severity: 'high',
                                 affected_surface: tamperedUrl,
                                 description: `Changing the resource ID from ${originalId} to ${testId} in ${url} returned data without authorization check. An attacker can enumerate IDs to access other users' data.`,
                                 reproduction: [
                                     `1. Original URL: ${url}`,
-                                    `2. Change ID ${originalId} to ${testId}: ${tamperedUrl}`,
+                                    `2. Change ID ${originalId} to ${testId}`,
                                     `3. Server returns data for the different resource`,
                                 ],
-                                evidence: `Original ID: ${originalId}\nTest ID: ${testId}\nResponse status: ${response.status}`,
+                                evidence: `Original ID: ${originalId}\nTest ID: ${testId}\nResponse status: ${response.status}\nResponse length: ${text.length} bytes`,
                                 remediation: 'Implement authorization checks that verify the requesting user owns the resource. Use UUIDs instead of sequential IDs. Always validate resource ownership server-side.',
                             }));
-                            break;
+                            break; // One IDOR per endpoint is enough
                         }
                     }
-                } catch { continue; }
-            }
-        }
-
-        return findings;
-    }
-
-    /**
-     * Test UUID-based IDOR — swap or fuzz UUIDs in API paths.
-     */
-    async _testUUIDIDOR(surfaceInventory) {
-        const findings = [];
-        const apis = surfaceInventory.apis || [];
-
-        const uuidRegex = /\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(\/|$|\?)/i;
-
-        for (const api of apis) {
-            const url = api.url || api;
-            const uuidMatch = url.match(uuidRegex);
-            if (!uuidMatch) continue;
-
-            const originalUUID = uuidMatch[1];
-
-            // Test with known-invalid UUIDs that might reveal different behavior
-            const testUUIDs = [
-                '00000000-0000-0000-0000-000000000000', // nil UUID
-                '00000000-0000-0000-0000-000000000001', // sequential
-                'ffffffff-ffff-ffff-ffff-ffffffffffff', // max UUID
-            ];
-
-            for (const testUUID of testUUIDs) {
-                const tamperedUrl = url.replace(originalUUID, testUUID);
-                try {
-                    const controller = new AbortController();
-                    const timeout = setTimeout(() => controller.abort(), 5000);
-
-                    const [originalResp, tamperedResp] = await Promise.all([
-                        fetch(url, { method: 'GET', signal: controller.signal }),
-                        fetch(tamperedUrl, { method: 'GET', signal: controller.signal }),
-                    ]);
-                    clearTimeout(timeout);
-
-                    if (tamperedResp.ok) {
-                        const text = await tamperedResp.text();
-                        if (text.length > 50 && !this._isGenericResponse(text)) {
-                            findings.push(createFinding({
-                                module: 'logic',
-                                title: 'IDOR: UUID-Based Object Reference Vulnerable to Enumeration',
-                                severity: 'high',
-                                affected_surface: tamperedUrl,
-                                description: `Swapping the UUID ${originalUUID} with ${testUUID} in ${url} returned a non-error response. If the application doesn't verify UUID ownership, an attacker can access arbitrary resources. UUIDs are only safe against enumeration when ownership is enforced server-side.`,
-                                reproduction: [
-                                    `1. Original URL: ${url}`,
-                                    `2. Swap UUID: ${tamperedUrl}`,
-                                    `3. Server returned status ${tamperedResp.status} with ${text.length} bytes`,
-                                ],
-                                evidence: `Original: ${originalUUID}\nTest: ${testUUID}\nResponse: ${tamperedResp.status} (${text.length} bytes)`,
-                                remediation: 'Never rely on UUIDs alone for access control — they prevent enumeration but not targeted sharing. Always verify the requesting user is the owner of the resource identified by the UUID, server-side on every request.',
-                            }));
-                            break;
-                        }
-                    }
-                } catch { continue; }
-            }
-        }
-
-        return findings;
-    }
-
-    /**
-     * Test cross-tenant access by manipulating tenant/org/workspace IDs.
-     */
-    async _testCrossTenantAccess(surfaceInventory) {
-        const findings = [];
-
-        const TENANT_PARAMS = [
-            'org_id', 'tenant_id', 'workspace_id', 'organization_id',
-            'company_id', 'account_id', 'team_id', 'site_id',
-        ];
-
-        for (const page of surfaceInventory.pages) {
-            if (!page.url || page.status >= 400) continue;
-            const url = new URL(page.url);
-            const params = [...url.searchParams.entries()];
-
-            for (const [key, value] of params) {
-                const isOrgParam = TENANT_PARAMS.some(p => key.toLowerCase().includes(p.replace('_id', '')));
-                if (!isOrgParam) continue;
-
-                // Try to access a different tenant's data
-                const testValues = [
-                    String(parseInt(value) + 1) || '2',
-                    String(parseInt(value) - 1) || '0',
-                    '1',
-                ];
-
-                const baseResponse = await fetch(page.url).catch(() => null);
-                if (!baseResponse?.ok) continue;
-                const baseText = await baseResponse.text();
-
-                for (const testValue of testValues) {
-                    if (testValue === value) continue;
-                    const testUrl = new URL(page.url);
-                    testUrl.searchParams.set(key, testValue);
-
-                    try {
-                        const response = await fetch(testUrl.toString(), { method: 'GET' });
-                        if (!response.ok) continue;
-
-                        const text = await response.text();
-                        // Different response length with different tenant ID = potential cross-tenant access
-                        const lengthRatio = text.length / (baseText.length || 1);
-                        if (text.length > 100 && lengthRatio > 0.5 && !this._isGenericResponse(text)) {
-                            findings.push(createFinding({
-                                module: 'logic',
-                                title: `Cross-Tenant Access: ${key} parameter not enforcing tenant isolation`,
-                                severity: 'critical',
-                                affected_surface: page.url,
-                                description: `Changing the ${key} parameter from ${value} to ${testValue} in ${page.url} returned data without authorization check. This indicates the server is not enforcing tenant isolation — an attacker from one tenant can access another tenant's data.`,
-                                reproduction: [
-                                    `1. Authenticated as tenant ${value}, access: ${page.url}`,
-                                    `2. Change ${key} to ${testValue}: ${testUrl.toString()}`,
-                                    `3. Server returns data belonging to tenant ${testValue}`,
-                                ],
-                                evidence: `Tenant param: ${key}\nOriginal value: ${value}\nTest value: ${testValue}\nResponse: ${response.status} (${text.length} bytes)`,
-                                remediation: 'All database queries must include a mandatory tenant_id filter derived from the authenticated session, never from user-supplied input. Use row-level security (RLS) in the database. Never trust client-provided tenant/org IDs for data access decisions.',
-                                references: ['CWE-284', 'OWASP API Security Top 10 – API1: Broken Object Level Authorization'],
-                            }));
-                            break;
-                        }
-                    } catch { continue; }
+                } catch {
+                    continue;
                 }
             }
         }

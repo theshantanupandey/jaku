@@ -1,6 +1,5 @@
 import { chromium } from 'playwright';
 import { createFinding } from '../utils/finding.js';
-import { CSRWaiter } from './csr-waiter.js';
 
 /**
  * Form Validator — Deep form validation testing.
@@ -80,10 +79,8 @@ export class FormValidator {
 
         // Try submitting with empty required fields
         const page = await context.newPage();
-        const csrWaiter = new CSRWaiter(this.logger);
         try {
-            await page.goto(form.page, { waitUntil: 'domcontentloaded', timeout: 20000 });
-            await csrWaiter.waitForContent(page, { timeout: 12000 });
+            await page.goto(form.page, { waitUntil: 'networkidle', timeout: 15000 });
 
             // Click submit without filling anything
             const submitBtn = await page.$(`#${form.id} button[type="submit"], #${form.id} input[type="submit"]`)
@@ -131,10 +128,8 @@ export class FormValidator {
         if (typeTestable.length === 0) return;
 
         const page = await context.newPage();
-        const csrWaiter2 = new CSRWaiter(this.logger);
         try {
-            await page.goto(form.page, { waitUntil: 'domcontentloaded', timeout: 20000 });
-            await csrWaiter2.waitForContent(page, { timeout: 12000 });
+            await page.goto(form.page, { waitUntil: 'networkidle', timeout: 15000 });
 
             for (const field of typeTestable) {
                 const invalidValues = this._getInvalidValues(field.type);

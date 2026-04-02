@@ -25,97 +25,39 @@ export class TestGenerator {
     }
 
     /**
-     * Smoke tests: one test per unique URL *pattern* (UUIDs and numeric IDs normalized).
-     * This prevents 49 identical findings for /trips/<uuid> pages.
+     * Smoke tests: every page loads with HTTP 200 and no JS errors.
      */
     _generateSmokeTests(inventory) {
-        const seenPatterns = new Map(); // pattern → first representative URL
-
-        for (const page of inventory.pages) {
-            const pattern = this._normalizePathPattern(page.url);
-            if (!seenPatterns.has(pattern)) {
-                seenPatterns.set(pattern, page.url);
-            }
-        }
-
-        const tests = [];
-        let idx = 0;
-        for (const [pattern, representativeUrl] of seenPatterns) {
-            // Count how many URLs match this pattern
-            const matchCount = inventory.pages.filter(
-                p => this._normalizePathPattern(p.url) === pattern
-            ).length;
-
-            tests.push({
-                id: `SMOKE-${String(++idx).padStart(3, '0')}`,
-                type: 'smoke',
-                surface: representativeUrl,
-                urlPattern: pattern,
-                matchCount,              // how many URLs share this pattern
-                title: matchCount > 1
-                    ? `Page loads successfully: ${pattern} (${matchCount} pages)`
-                    : `Page loads successfully: ${this._shortUrl(representativeUrl)}`,
-                steps: [
-                    { action: 'navigate', url: representativeUrl },
-                    { action: 'assert_status', expected: 200 },
-                    { action: 'assert_no_console_errors' },
-                    { action: 'assert_has_content' },
-                ],
-                expected: {
-                    status: 200,
-                    noConsoleErrors: true,
-                    hasContent: true,
-                },
-            });
-        }
-
-        this.logger?.info?.(`Smoke tests: ${inventory.pages.length} pages → ${tests.length} pattern-deduplicated tests`);
-        return tests;
-    }
-
-    /**
-     * Normalize a URL path to a pattern by replacing:
-     *  - UUIDs  (8-4-4-4-12 hex)   → :uuid
-     *  - Long numeric IDs (> 4 digits) → :id
-     *  - Short numeric segments      → :n
-     * Also strips query strings and hashes.
-     *
-     * Examples:
-     *  /trips/5f8579e0-0054-4cb9-b80e-b00b19369536?edit=true → /trips/:uuid
-     *  /profile/42                                          → /profile/:n
-     *  /packages/rajasthan-royal-heritage-tour              → /packages/rajasthan-royal-heritage-tour (unchanged)
-     */
-    _normalizePathPattern(url) {
-        try {
-            const u = new URL(url);
-            const pathname = u.pathname
-                // UUID pattern (8-4-4-4-12)
-                .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, ':uuid')
-                // Long numeric IDs (5+ digits are definitely database IDs)
-                .replace(/\/[0-9]{5,}/g, '/:id')
-                // Short numeric path segments (e.g. /profile/3)
-                .replace(/\/[0-9]{1,4}(?=\/|$)/g, '/:n')
-                // Trailing slash normalization
-                .replace(/\/+$/, '') || '/';
-            return pathname;
-        } catch {
-            return url;
-        }
+        return inventory.pages.map((page, idx) => ({
+            id: `SMOKE-${String(idx + 1).padStart(3, '0')}`,
+            type: 'smoke',
+            surface: page.url,
+            title: `Page loads successfully: ${this._shortUrl(page.url)}`,
+            steps: [
+                { action: 'navigate', url: page.url },
+                { action: 'assert_status', expected: 200 },
+                { action: 'assert_no_console_errors' },
+                { action: 'assert_has_content' },
+            ],
+            expected: {
+                status: 200,
+                noConsoleErrors: true,
+                hasContent: true,
+            },
+        }));
     }
 
     /**
      * Navigation tests: all internal links are reachable.
-     * Deduplicated by normalized URL pattern to avoid testing 49 /trips/<uuid> links.
      */
     _generateNavigationTests(inventory) {
         const tests = [];
-        const testedPatterns = new Set();
+        const testedLinks = new Set();
 
         for (const page of inventory.pages) {
             for (const link of (page.links || [])) {
-                const pattern = this._normalizePathPattern(link);
-                if (testedPatterns.has(pattern)) continue;
-                testedPatterns.add(pattern);
+                if (testedLinks.has(link)) continue;
+                testedLinks.add(link);
 
                 tests.push({
                     id: `NAV-${String(tests.length + 1).padStart(3, '0')}`,

