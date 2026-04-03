@@ -467,7 +467,7 @@ node src/cli.js ai https://myapp.dev/api/chat --max-pages 1 -v
 ```
   ╦╔═╗╦╔═╦ ╦
   ║╠═╣╠╩╗║ ║  呪 Autonomous Security & Quality Intelligence
- ╚╝╩ ╩╩ ╩╚═╝  v1.0.2 · Multi-Agent
+ ╚╝╩ ╩╩ ╩╚═╝  v1.0.3 · Multi-Agent
 
   Target:  https://your-app.dev
   Modules: QA + SECURITY + AI

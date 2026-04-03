@@ -141,8 +141,8 @@ export function generateSARIF(findings, meta = {}) {
             tool: {
                 driver: {
                     name: 'JAKU',
-                    version: meta.version || '1.0.2',
-                    semanticVersion: meta.version || '1.0.2',
+                    version: meta.version || '1.0.3',
+                    semanticVersion: meta.version || '1.0.3',
                     informationUri: 'https://github.com/jaku-security',
                     rules,
                 },

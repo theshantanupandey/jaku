@@ -217,7 +217,7 @@ runs:
               }
             }
             
-            body += '\n---\n*Scanned by [JAKU](https://github.com/jaku-security/jaku) v1.0.2*';
+            body += '\n---\n*Scanned by [JAKU](https://github.com/jaku-security/jaku) v1.0.3*';
           } else {
             body += '⚠️ Scan completed but no report was generated. Check workflow logs for errors.';
           }

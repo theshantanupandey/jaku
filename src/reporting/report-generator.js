@@ -38,7 +38,7 @@ export class ReportGenerator {
     const reportData = {
       meta: {
         agent: 'JAKU',
-        version: '1.0.2',
+        version: '1.0.3',
         module: 'qa',
         target: this.config.target_url,
         scannedAt: new Date().toISOString(),

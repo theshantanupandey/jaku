@@ -18,7 +18,7 @@ import { AuthManager } from './core/auth-manager.js';
 const BANNER = `
 ${chalk.hex('#00ff88').bold('  ╦╔═╗╦╔═╦ ╦')}
 ${chalk.hex('#00ff88').bold('  ║╠═╣╠╩╗║ ║')}  ${chalk.dim('呪 Autonomous Security & Quality Intelligence')}
-${chalk.hex('#00ff88').bold(' ╚╝╩ ╩╩ ╩╚═╝')}  ${chalk.dim('v1.0.2 · Multi-Agent')}
+${chalk.hex('#00ff88').bold(' ╚╝╩ ╩╩ ╩╚═╝')}  ${chalk.dim('v1.0.3 · Multi-Agent')}
 `;
 
 const program = new Command();
@@ -26,7 +26,7 @@ const program = new Command();
 program
     .name('jaku')
     .description('JAKU (呪) — Autonomous QA & Security scanning agent for vibe-coded apps')
-    .version('1.0.2');
+    .version('1.0.3');
 
 // ═══════════════════════════════════════════════
 // Multi-Agent Scan Runner
@@ -234,7 +234,7 @@ async function runScan(url, options, modulesToRun) {
                 options.compliance,
                 results.findings,
                 reportDir,
-                { target: url, version: '1.0.2', scannedAt: new Date().toISOString() }
+                { target: url, version: '1.0.3', scannedAt: new Date().toISOString() }
             );
         }
 

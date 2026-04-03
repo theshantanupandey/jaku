@@ -255,7 +255,7 @@ export class Orchestrator {
         try {
             const payload = {
                 agent: 'JAKU',
-                version: '1.0.2',
+                version: '1.0.3',
                 target: this.config.target_url,
                 timestamp: new Date().toISOString(),
                 duration: results.duration,
