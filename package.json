@@ -1,6 +1,6 @@
 {
   "name": "jaku.sh",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "JAKU (呪) — Autonomous Security & Quality Intelligence Agent for vibe-coded apps. XSS, SQLi, prompt injection, QA testing, and attack chain correlation in one command.",
   "type": "module",
   "main": "src/cli.js",
@@ -42,7 +42,7 @@
     "url": "https://github.com/theshantanupandey"
   },
   "license": "SEE LICENSE IN LICENSE",
-  "homepage": "https://jakusec.dev",
+  "homepage": "https://jaku.app",
   "repository": {
     "type": "git",
     "url": "https://github.com/theshantanupandey/jaku.git"

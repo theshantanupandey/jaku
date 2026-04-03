@@ -38,7 +38,7 @@ export class ReportGenerator {
     const reportData = {
       meta: {
         agent: 'JAKU',
-        version: '1.0.1',
+        version: '1.0.2',
         module: 'qa',
         target: this.config.target_url,
         scannedAt: new Date().toISOString(),
@@ -136,6 +136,9 @@ export class ReportGenerator {
 
       for (const f of sevFindings) {
         md += `#### ${f.id}: ${f.title}\n\n`;
+        md += `**Severity:** ${f.severity.toUpperCase()}`;
+        if (f.owasp) md += `  |  **OWASP:** ${f.owasp.id} ${f.owasp.name}`;
+        md += `  \n`;
         md += `**Affected:** ${f.affected_surface}  \n`;
         md += `**Status:** ${f.status}  \n\n`;
         md += `${f.description}\n\n`;
@@ -309,6 +312,7 @@ export class ReportGenerator {
       <div class="finding-desc">${this._escapeHtml(f.description)}</div>
       <div style="font-size:0.8rem;color:var(--text-dim);margin-top:0.5rem">
         <strong>Affected:</strong> ${this._escapeHtml(f.affected_surface)}
+        ${f.owasp ? `<span style="margin-left:1rem;padding:2px 6px;border-radius:3px;background:#1a1a25;color:#00ff88;font-size:0.7rem;font-weight:bold">${f.owasp.id} ${this._escapeHtml(f.owasp.name)}</span>` : ''}
       </div>
       ${f.remediation ? `<div style="font-size:0.85rem;margin-top:0.5rem;color:var(--accent)"><strong>Fix:</strong> ${this._escapeHtml(f.remediation)}</div>` : ''}
       <details class="finding-details">

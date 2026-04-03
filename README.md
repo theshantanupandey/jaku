@@ -28,27 +28,23 @@ JAKU crawls your entire app, generates test cases, probes for security vulnerabi
 ## Quick Start
 
 ```bash
-# Option A: Clone & install (development)
-git clone https://github.com/theshantanupandey/jaku.git
-cd jaku
-npm install
-npx playwright install chromium
-
-# Option B: Install globally via npm
-npm install -g @theshantanupandey/jaku
+# Install globally via npm
+npm install -g jaku.sh
 npx playwright install chromium
 
 # Run a full scan (QA + Security + AI + Logic + API)
-jaku scan https://your-app.dev --verbose
-# or without global install:
-node src/cli.js scan https://your-app.dev --verbose
+jaku scan https://your-app.dev --prod-safe
+
+# Quick scan (10 pages, fast feedback)
+jaku scan https://your-app.dev --profile quick --prod-safe
+
+# With OWASP Top 10 compliance report
+jaku scan https://your-app.dev --compliance owasp --prod-safe
 
 # AI abuse testing only
-jaku ai https://your-ai-app.dev --verbose
-
+jaku ai https://your-ai-app.dev
 
 # Reports are saved to ./jaku-reports/<timestamp>/
-# latest-report.json is auto-updated at project root after each scan
 ```
 
 ### First Scan Walkthrough
@@ -414,6 +410,8 @@ Correlations appear in the CLI output and reports with severity escalation.
 | `-c, --config <path>` | Path to config file | `./jaku.config.json` |
 | `-o, --output <dir>` | Output directory for reports | `./jaku-reports/<timestamp>` |
 | `-s, --severity <level>` | Minimum severity threshold (`critical`, `high`, `medium`, `low`) | `low` |
+| `--profile <type>` | Scan profile: `quick`, `deep`, `ci` | — |
+| `--compliance <framework>` | Generate compliance report (`owasp`) | — |
 | `--max-pages <n>` | Maximum pages to crawl | `50` |
 | `--max-depth <n>` | Maximum crawl depth | `5` |
 | `--halt-on-critical` | Abort scan immediately on any critical finding | off |
@@ -434,6 +432,7 @@ Every scan generates 5 report files:
 | **HTML** | `report.html` | Self-contained browsable report with severity charts |
 | **SARIF** | `report.sarif` | GitHub/GitLab Security Dashboard integration (SARIF v2.1.0) |
 | **Diff** | `diff-report.md` | Regression detection vs. previous scan run |
+| **OWASP Compliance** | `compliance-owasp.*` | OWASP Top 10 pass/fail report (JSON + MD + HTML) — requires `--compliance owasp` |
 
 ### Examples
 
@@ -468,7 +467,7 @@ node src/cli.js ai https://myapp.dev/api/chat --max-pages 1 -v
 ```
   ╦╔═╗╦╔═╦ ╦
   ║╠═╣╠╩╗║ ║  呪 Autonomous Security & Quality Intelligence
- ╚╝╩ ╩╩ ╩╚═╝  v1.0.1 · Multi-Agent
+ ╚╝╩ ╩╩ ╩╚═╝  v1.0.2 · Multi-Agent
 
   Target:  https://your-app.dev
   Modules: QA + SECURITY + AI
@@ -634,3 +633,9 @@ Every JAKU scan generates a self-contained **HTML report** at `jaku-reports/<tim
 ## License
 
 [Jaku Public License v1.0](./LICENSE) — free to use, modify, and distribute with attribution. See [LICENSE](./LICENSE) for full terms.
+
+---
+
+**Website:** [jaku.app](https://jaku.app)  
+**npm:** [jaku.sh](https://www.npmjs.com/package/jaku.sh)  
+**GitHub:** [theshantanupandey/jaku](https://github.com/theshantanupandey/jaku)

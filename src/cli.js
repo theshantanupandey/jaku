@@ -12,12 +12,13 @@ import { AIAgent } from './agents/ai-agent.js';
 import { LogicAgent } from './agents/logic-agent.js';
 import { APIAgent } from './agents/api-agent.js';
 import { ReportGenerator } from './reporting/report-generator.js';
+import { ComplianceReporter } from './reporting/compliance-reporter.js';
 import { AuthManager } from './core/auth-manager.js';
 
 const BANNER = `
 ${chalk.hex('#00ff88').bold('  ╦╔═╗╦╔═╦ ╦')}
 ${chalk.hex('#00ff88').bold('  ║╠═╣╠╩╗║ ║')}  ${chalk.dim('呪 Autonomous Security & Quality Intelligence')}
-${chalk.hex('#00ff88').bold(' ╚╝╩ ╩╩ ╩╚═╝')}  ${chalk.dim('v1.0.1 · Multi-Agent')}
+${chalk.hex('#00ff88').bold(' ╚╝╩ ╩╩ ╩╚═╝')}  ${chalk.dim('v1.0.2 · Multi-Agent')}
 `;
 
 const program = new Command();
@@ -25,7 +26,7 @@ const program = new Command();
 program
     .name('jaku')
     .description('JAKU (呪) — Autonomous QA & Security scanning agent for vibe-coded apps')
-    .version('1.0.1');
+    .version('1.0.2');
 
 // ═══════════════════════════════════════════════
 // Multi-Agent Scan Runner
@@ -225,6 +226,18 @@ async function runScan(url, options, modulesToRun) {
             outputDir: config.output_dir,
         });
 
+        // Generate compliance report if requested
+        let complianceResult = null;
+        if (options.compliance) {
+            const complianceReporter = new ComplianceReporter(config, logger);
+            complianceResult = complianceReporter.generate(
+                options.compliance,
+                results.findings,
+                reportDir,
+                { target: url, version: '1.0.2', scannedAt: new Date().toISOString() }
+            );
+        }
+
         reportSpinner.succeed(`Reports saved to ${chalk.underline(reportDir)}`);
 
         // ═══════════════════════════════════════
@@ -266,6 +279,23 @@ async function runScan(url, options, modulesToRun) {
             }
         }
 
+        // OWASP Compliance Summary
+        if (complianceResult?.compliance) {
+            const c = complianceResult.compliance;
+            console.log();
+            console.log(chalk.hex('#00ff88').bold('  ═══ OWASP TOP 10 COMPLIANCE ═══'));
+            console.log();
+            const scoreColor = c.percentage >= 80 ? '#00e676' : c.percentage >= 50 ? '#ffd600' : '#ff1744';
+            console.log(`  ${chalk.dim('Score:')}       ${chalk.hex(scoreColor).bold(`${c.score}/${c.total}`)} (${c.percentage}%)`);
+            console.log();
+            for (const cat of c.categories) {
+                const icon = cat.status === 'pass' ? chalk.hex('#00e676')('✔') : cat.status === 'fail' ? chalk.red('✘') : chalk.yellow('⚠');
+                const label = `${cat.id} ${cat.name}`;
+                const count = cat.findingsCount > 0 ? chalk.dim(` (${cat.findingsCount} findings)`) : '';
+                console.log(`  ${icon} ${label}${count}`);
+            }
+        }
+
         console.log();
 
         if (summary.critical > 0) {
@@ -298,6 +328,7 @@ program
     .option('-m, --modules <list>', 'Comma-separated modules to run (qa,security,ai,logic,api)', 'qa,security,ai,logic,api')
     .option('-s, --severity <level>', 'Minimum severity threshold (critical|high|medium|low)', 'low')
     .option('--profile <type>', 'Scan profile: quick|deep|ci (overrides crawl settings)')
+    .option('--compliance <framework>', 'Generate compliance report (owasp)')
     .option('--json', 'Output JSON report')
     .option('--html', 'Output HTML report')
     .option('--max-pages <n>', 'Maximum pages to crawl', '50')
