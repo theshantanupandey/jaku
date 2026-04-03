@@ -1,9 +1,11 @@
 import { nanoid } from 'nanoid';
+import { tagFinding } from './owasp-mapper.js';
 
 const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low', 'info'];
 
 /**
  * Creates a JAKU Finding object matching the manifest schema.
+ * Automatically tagged with OWASP Top 10 (2021) classification.
  */
 export function createFinding({
     module = 'qa',
@@ -20,7 +22,7 @@ export function createFinding({
     const prefix = module.toUpperCase();
     const shortId = nanoid(6);
 
-    return {
+    const finding = {
         id: `JAKU-${prefix}-${shortId}`,
         module,
         title,
@@ -34,6 +36,9 @@ export function createFinding({
         status,
         timestamp: new Date().toISOString(),
     };
+
+    // Auto-tag with OWASP Top 10 classification
+    return tagFinding(finding);
 }
 
 /**
