@@ -45,7 +45,28 @@ export class Crawler {
      */
     async crawl(targetUrl, authState = null, seedLinks = []) {
         this.baseUrl = new URL(targetUrl);
-        const browser = await chromium.launch({ headless: true });
+
+        let browser;
+        try {
+            browser = await chromium.launch({ headless: true });
+        } catch (err) {
+            if (err.message.includes("Executable doesn't exist") || err.message.includes('playwright install')) {
+                this.logger?.warn?.('Chromium not found — attempting automatic install...');
+                const { execSync } = await import('child_process');
+                try {
+                    execSync('npx playwright install chromium', { stdio: 'inherit', timeout: 120000 });
+                    browser = await chromium.launch({ headless: true });
+                } catch {
+                    throw new Error(
+                        'Playwright Chromium is not installed. Run:\n\n' +
+                        '    npx playwright install chromium\n\n' +
+                        'Then re-run your jaku command.'
+                    );
+                }
+            } else {
+                throw err;
+            }
+        }
 
         const contextOptions = {
             viewport: { width: 1440, height: 900 },

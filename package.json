@@ -18,6 +18,7 @@
   ],
   "scripts": {
     "scan": "node src/cli.js scan",
+    "postinstall": "npx playwright install chromium 2>/dev/null || echo '⚠ JAKU: Could not auto-install Chromium. Run: npx playwright install chromium'",
     "prepublishOnly": "node src/cli.js --help"
   },
   "keywords": [
