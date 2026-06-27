@@ -11,6 +11,7 @@ JAKU crawls your entire app, generates test cases, probes for security vulnerabi
 ## Table of Contents
 
 - [Quick Start](#quick-start)
+- [Updating](#updating)
 - [Architecture](#architecture)
 - [Module 01 — QA & Functional Testing](#module-01--qa--functional-testing)
 - [Module 02 — Security Vulnerability Scanning](#module-02--security-vulnerability-scanning)
@@ -69,6 +70,51 @@ node src/cli.js security https://your-app.dev --severity high
 # Reports saved to ./jaku-reports/<timestamp>/
 # Open report.html for the visual report
 ```
+
+---
+
+## Updating
+
+Already running JAKU? Update to the latest release:
+
+```bash
+# Global install (most common)
+npm install -g jaku.sh@latest
+jaku --version            # confirm you're on the latest
+
+# Refresh the browser engine if the post-install step was skipped
+npx playwright install chromium
+```
+
+```bash
+# npx users — pin @latest so a stale cached copy isn't reused
+npx jaku.sh@latest scan https://your-app.dev --prod-safe
+
+# Project dependency
+npm install -D jaku.sh@latest
+
+# GitHub Action — pin to the release tag
+# - uses: theshantanupandey/jaku@v1.2.0
+```
+
+### What's new in v1.2.0
+
+> ⚠ **Behavior change for existing users:** destructive business-logic tests
+> (race conditions, pricing/checkout mutation, etc.) are now **gated behind
+> `--aggressive`** and **skipped by default**. A plain `jaku scan` is now safer
+> than before — if you relied on those tests running by default, add
+> `--aggressive`. Everything else is additive and backward-compatible.
+
+| Area | Change |
+|------|--------|
+| **Safety modes** | New `--passive` / `--safe-active` (default) / `--aggressive` tiers; destructive tests gated to `--aggressive` |
+| **AI testing fix** | AI endpoint detection now works on JSON/API chat endpoints (previously skipped silently) |
+| **LLM augmentation** | Optional, bring-your-own-key AI assistance — remediation, exec summaries, tailored payloads, FP triage. Off by default, no new dependencies — see [LLM Augmentation](#llm-augmentation-optional) |
+| **Deeper scanning** | Real parameter discovery for XSS/SQLi + boolean-based and time-based **blind SQLi** detection |
+| **Better outputs** | Reports reflect the actual modules that ran; SARIF adds `partialFingerprints` + proper web URIs for cross-run tracking |
+| **Config & safety** | Lightweight config validation with warnings; API keys rejected from config files; version centralized |
+
+Full file-level history is on [GitHub](https://github.com/theshantanupandey/jaku/commits/main).
 
 ---
 
