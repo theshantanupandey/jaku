@@ -5,7 +5,7 @@
   "type": "module",
   "main": "src/cli.js",
   "bin": {
-    "jaku": "./bin/jaku"
+    "jaku": "bin/jaku"
   },
   "engines": {
     "node": ">=20"
@@ -46,7 +46,7 @@
   "homepage": "https://jaku.app",
   "repository": {
     "type": "git",
-    "url": "https://github.com/theshantanupandey/jaku.git"
+    "url": "git+https://github.com/theshantanupandey/jaku.git"
   },
   "bugs": {
     "url": "https://github.com/theshantanupandey/jaku/issues"
