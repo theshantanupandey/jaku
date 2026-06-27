@@ -116,7 +116,7 @@ export class AccessBoundaryTester {
      */
     async _testIDOR(businessContext, surfaceInventory) {
         const findings = [];
-        const apis = surfaceInventory.apis || [];
+        const apis = surfaceInventory.apiEndpoints || surfaceInventory.apis || [];
 
         for (const api of apis) {
             const url = api.url || api;

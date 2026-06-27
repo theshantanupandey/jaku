@@ -3,20 +3,40 @@ import path from 'path';
 import { sortFindings, filterBySeverity, severitySummary } from '../utils/finding.js';
 import { writeSARIF } from './sarif-generator.js';
 import { DiffReporter } from './diff-reporter.js';
+import { getVersion } from '../utils/version.js';
+import { enhanceRemediation, generateExecutiveSummary } from '../core/llm/augmentations.js';
+
+/** Friendly labels for module keys, used in report headings. */
+const MODULE_LABELS = {
+  qa: 'QA & Functional Testing',
+  security: 'Security Vulnerability Scanning',
+  ai: 'Prompt Injection & AI Abuse',
+  logic: 'Business Logic Validation',
+  api: 'API & Auth Flow Verification',
+};
+
+/** Build a human-readable label from a list of executed module keys. */
+function formatModules(modules) {
+  if (!Array.isArray(modules) || modules.length === 0) return 'Security & Quality';
+  return modules.map(m => MODULE_LABELS[m] || m).join(', ');
+}
 
 /**
  * Report Generator — Generates structured output in JSON, Markdown, HTML, and SARIF formats.
  */
 export class ReportGenerator {
-  constructor(config, logger) {
+  constructor(config, logger, llmClient = null) {
     this.config = config;
     this.logger = logger;
+    // Optional LLM client. When null/disabled, all augmentation is skipped and
+    // reports render exactly as before (template remediation, no AI summary).
+    this.llmClient = llmClient;
   }
 
   /**
    * Generate all reports from findings and test results.
    */
-  async generate({ findings, deduplicated, dedupStats, testSummary, surfaceInventory, outputDir }) {
+  async generate({ findings, deduplicated, dedupStats, testSummary, surfaceInventory, outputDir, modules }) {
     const reportDir = outputDir || path.join(process.cwd(), 'jaku-reports', this._timestamp());
     if (!fs.existsSync(reportDir)) {
       fs.mkdirSync(reportDir, { recursive: true });
@@ -35,11 +55,17 @@ export class ReportGenerator {
     const summary = severitySummary(filteredFindings);
     const dedupSummary = severitySummary(reportFindings);
 
+    // Resolve which modules actually ran: explicit arg → config → enabled list.
+    const executedModules = (modules && modules.length > 0)
+      ? modules
+      : (this.config.modules_enabled || []);
+
     const reportData = {
       meta: {
         agent: 'JAKU',
-        version: '1.0.3',
-        module: 'qa',
+        version: getVersion(),
+        modules: executedModules,
+        modulesLabel: formatModules(executedModules),
         target: this.config.target_url,
         scannedAt: new Date().toISOString(),
         duration: testSummary?.duration || null,
@@ -56,6 +82,10 @@ export class ReportGenerator {
       findings: reportFindings,
       rawFindings: filteredFindings,
     };
+
+    // Optional, additive LLM augmentation (remediation + executive summary).
+    // No-op when the client is disabled; reports render unchanged on null.
+    await this._augmentWithLLM(reportFindings, reportData);
 
     // Generate JSON
     const jsonPath = path.join(reportDir, 'report.json');
@@ -82,18 +112,60 @@ export class ReportGenerator {
   }
 
 
+  /**
+   * Phase 0 + Phase 2 LLM augmentation. STRICTLY ADDITIVE and best-effort:
+   *   - Per-finding remediation (falls back to template when LLM returns null).
+   *   - One executive-summary paragraph (omitted when null).
+   * Tags LLM-derived content so the report can label it.
+   */
+  async _augmentWithLLM(findings, reportData) {
+    const client = this.llmClient;
+    if (!client?.isEnabled?.()) return;
+
+    try {
+      // Remediation: only top findings to respect call/token budget.
+      const prioritized = findings
+        .filter(f => ['critical', 'high', 'medium'].includes(f.severity))
+        .slice(0, 20);
+      for (const f of prioritized) {
+        const text = await enhanceRemediation(client, f);
+        if (text) {
+          f.remediation_llm = text;
+          f.remediation_source = 'llm';
+        }
+      }
+
+      // Executive summary (titles + counts only — data minimization).
+      const summaryText = await generateExecutiveSummary(client, {
+        target: reportData.meta.target,
+        summary: reportData.dedupSummary || reportData.summary,
+        topTitles: findings.slice(0, 15).map(f => `[${f.severity}] ${f.title}`),
+      });
+      if (summaryText) {
+        reportData.meta.executiveSummary = summaryText;
+        reportData.meta.executiveSummarySource = 'llm';
+      }
+    } catch (err) {
+      this.logger?.debug?.(`[LLM] report augmentation skipped: ${err.message}`);
+    }
+  }
+
   _generateMarkdown(data) {
     const { meta, summary, testSummary, surfaceInventory, findings } = data;
     let md = '';
 
     md += `# 呪 JAKU Security & Quality Report\n\n`;
     md += `**Target:** ${meta.target}  \n`;
-    md += `**Module:** Quality Assurance & Functional Testing  \n`;
+    md += `**Modules:** ${meta.modulesLabel || formatModules(meta.modules)}  \n`;
     md += `**Scanned:** ${meta.scannedAt}  \n`;
     md += `**Agent Version:** ${meta.version}  \n\n`;
 
     md += `---\n\n`;
     md += `## Executive Summary\n\n`;
+    if (meta.executiveSummary) {
+      md += `${meta.executiveSummary}\n\n`;
+      md += `*(AI-assisted summary — advisory only)*\n\n`;
+    }
     md += `| Metric | Value |\n`;
     md += `|--------|-------|\n`;
     md += `| Total Findings | ${summary.total} |\n`;
@@ -151,8 +223,15 @@ export class ReportGenerator {
           md += `\n`;
         }
 
-        if (f.remediation) {
-          md += `**Remediation:** ${f.remediation}\n\n`;
+        const remediation = f.remediation_llm || f.remediation;
+        if (remediation) {
+          const tag = f.remediation_llm ? ' (AI-assisted)' : '';
+          md += `**Remediation${tag}:** ${remediation}\n\n`;
+        }
+
+        if (f.llm_triage) {
+          const conf = f.llm_triage.confidence != null ? ` (confidence ${(f.llm_triage.confidence * 100).toFixed(0)}%)` : '';
+          md += `**AI triage (advisory):** ${f.llm_triage.assessment}${conf}${f.llm_triage.note ? ` — ${f.llm_triage.note}` : ''}\n\n`;
         }
 
         md += `---\n\n`;
@@ -256,9 +335,16 @@ export class ReportGenerator {
   <h1>呪 JAKU</h1>
   <div class="meta">
     <span>Target: ${meta.target}</span>
-    <span>Module: QA & Functional Testing</span>
+    <span>Modules: ${this._escapeHtml(meta.modulesLabel || formatModules(meta.modules))}</span>
     <span>Scanned: ${new Date(meta.scannedAt).toLocaleString()}</span>
   </div>
+
+  ${meta.executiveSummary ? `
+  <h2>Executive Summary</h2>
+  <div class="finding-card" style="border-left-color:var(--accent)">
+    <div class="finding-desc">${this._escapeHtml(meta.executiveSummary)}</div>
+    <div style="font-size:0.7rem;color:var(--text-dim);margin-top:0.5rem">AI-assisted summary — advisory only</div>
+  </div>` : ''}
 
   <h2>Severity Breakdown</h2>
   <div class="summary-grid">
@@ -314,7 +400,8 @@ export class ReportGenerator {
         <strong>Affected:</strong> ${this._escapeHtml(f.affected_surface)}
         ${f.owasp ? `<span style="margin-left:1rem;padding:2px 6px;border-radius:3px;background:#1a1a25;color:#00ff88;font-size:0.7rem;font-weight:bold">${f.owasp.id} ${this._escapeHtml(f.owasp.name)}</span>` : ''}
       </div>
-      ${f.remediation ? `<div style="font-size:0.85rem;margin-top:0.5rem;color:var(--accent)"><strong>Fix:</strong> ${this._escapeHtml(f.remediation)}</div>` : ''}
+      ${(f.remediation_llm || f.remediation) ? `<div style="font-size:0.85rem;margin-top:0.5rem;color:var(--accent)"><strong>Fix${f.remediation_llm ? ' (AI-assisted)' : ''}:</strong> ${this._escapeHtml(f.remediation_llm || f.remediation)}</div>` : ''}
+      ${f.llm_triage ? `<div style="font-size:0.8rem;margin-top:0.5rem;color:var(--text-dim)"><strong>AI triage (advisory):</strong> ${this._escapeHtml(f.llm_triage.assessment)}${f.llm_triage.confidence != null ? ` (${(f.llm_triage.confidence * 100).toFixed(0)}%)` : ''}${f.llm_triage.note ? ` — ${this._escapeHtml(f.llm_triage.note)}` : ''}</div>` : ''}
       <details class="finding-details">
         <summary>Evidence & Reproduction</summary>
         <pre>${this._escapeHtml(f.reproduction?.join?.('\\n') || '')}</pre>

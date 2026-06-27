@@ -1,14 +1,23 @@
 import { chromium } from 'playwright';
 import { createFinding } from '../../utils/finding.js';
+import { collectParamNames } from '../../utils/param-discovery.js';
 
 /**
  * SQLi Prober — Tests query-bearing inputs for SQL/NoSQL injection vulnerabilities.
  * SAFETY: Simulation only — no destructive payloads (DROP, DELETE, etc.) are ever sent.
+ *
+ * Detection strategies:
+ *   1. Error-based   — diagnostic payloads that surface DB error signatures
+ *   2. Boolean blind — compare TRUE vs FALSE condition responses
+ *   3. Time blind    — measure response delay for a sleep payload
  */
 export class SQLiProber {
     constructor(logger) {
         this.logger = logger;
         this.findings = [];
+        this._candidateParams = [];
+        // Budget for expensive time-based probes (each adds ~5s of delay).
+        this._timeBudget = 12;
     }
 
     // SQL injection test payloads — detection-only, non-destructive
@@ -17,10 +26,31 @@ export class SQLiProber {
         { name: 'Classic OR', payload: "' OR '1'='1", errorPatterns: ['sql', 'syntax', 'query'] },
         { name: 'Double dash comment', payload: "' -- ", errorPatterns: ['sql', 'syntax'] },
         { name: 'UNION probe', payload: "' UNION SELECT NULL--", errorPatterns: ['union', 'select', 'column'] },
-        { name: 'Boolean blind true', payload: "' AND '1'='1", errorPatterns: [] },
-        { name: 'Boolean blind false', payload: "' AND '1'='2", errorPatterns: [] },
         { name: 'Numeric injection', payload: '1 OR 1=1', errorPatterns: ['sql', 'syntax'] },
         { name: 'Stacked query probe', payload: "'; SELECT 1--", errorPatterns: ['syntax', 'multiple'] },
+    ];
+
+    // Fallback guess-list of common query parameter names, used to AUGMENT
+    // (never replace) parameters discovered from the actual surface.
+    static FALLBACK_PARAMS = [
+        'id', 'user', 'user_id', 'uid', 'page', 'item', 'product', 'product_id',
+        'category', 'cat', 'q', 'search', 'query', 'name', 'order', 'sort', 'filter',
+    ];
+
+    // Boolean-based blind pairs (logically-true vs logically-false conditions).
+    static BOOLEAN_PAIRS = [
+        { context: 'string-and', truePayload: "' AND '1'='1", falsePayload: "' AND '1'='2" },
+        { context: 'numeric-and', truePayload: ' AND 1=1', falsePayload: ' AND 1=2' },
+        { context: 'string-or', truePayload: "' OR '1'='1' -- ", falsePayload: "' OR '1'='2' -- " },
+    ];
+
+    // Time-based blind payloads (5s sleep across common DB engines).
+    static SLEEP_SECONDS = 5;
+    static TIME_PAYLOADS = [
+        { db: 'MySQL (string)', payload: "' AND SLEEP(5)-- -" },
+        { db: 'MySQL (numeric)', payload: ' AND SLEEP(5)-- -' },
+        { db: 'PostgreSQL', payload: "'; SELECT pg_sleep(5)-- -" },
+        { db: 'MSSQL', payload: "'; WAITFOR DELAY '0:0:5'-- -" },
     ];
 
     // NoSQL injection payloads for JSON bodies
@@ -56,6 +86,17 @@ export class SQLiProber {
      * Run SQL injection probing on all discovered surfaces.
      */
     async probe(surfaceInventory) {
+        // Derive real candidate params from forms, query strings, and API URLs,
+        // then augment with the fallback guess-list (discovered take priority).
+        const discovered = collectParamNames(surfaceInventory);
+        this._candidateParams = [
+            ...discovered,
+            ...SQLiProber.FALLBACK_PARAMS.filter(p => !discovered.includes(p)),
+        ];
+        this.logger?.debug?.(
+            `SQLi prober: ${discovered.length} discovered params + ${SQLiProber.FALLBACK_PARAMS.length} fallback`
+        );
+
         // Test URL parameters
         await this._testURLParams(surfaceInventory);
 
@@ -70,57 +111,285 @@ export class SQLiProber {
     }
 
     /**
-     * Test URL query parameters for SQL injection.
+     * Test URL query parameters for SQL injection (error, boolean, and time blind).
      */
     async _testURLParams(inventory) {
         for (const page of inventory.pages) {
             if (typeof page.status !== 'number') continue;
 
+            let parsedUrl;
             try {
-                const parsedUrl = new URL(page.url);
-                const params = [...parsedUrl.searchParams.keys()];
-                if (params.length === 0) continue;
-
-                for (const param of params) {
-                    for (const { name, payload } of SQLiProber.SQL_PAYLOADS.slice(0, 4)) {
-                        const testUrl = new URL(page.url);
-                        testUrl.searchParams.set(param, payload);
-
-                        try {
-                            const resp = await fetch(testUrl.toString(), {
-                                signal: AbortSignal.timeout(10000),
-                                redirect: 'follow',
-                            });
-                            const body = await resp.text();
-
-                            const errorMatch = this._detectSQLError(body);
-                            if (errorMatch) {
-                                this.findings.push(createFinding({
-                                    module: 'security',
-                                    title: `SQL Injection: ${param} parameter (${name})`,
-                                    severity: 'critical',
-                                    affected_surface: page.url,
-                                    description: `The URL parameter "${param}" appears vulnerable to SQL injection. The "${name}" payload triggered a database error in the response, indicating unsanitized input is being passed directly to SQL queries.\n\nError signature: ${errorMatch}`,
-                                    reproduction: [
-                                        `1. Navigate to: ${testUrl.toString()}`,
-                                        `2. Observe database error message in the response`,
-                                        `3. Error signature: ${errorMatch}`,
-                                    ],
-                                    evidence: JSON.stringify({ param, payload: name, errorSignature: errorMatch, responseSnippet: body.substring(0, 300) }),
-                                    remediation: 'Use parameterized queries (prepared statements) for all database operations. Never concatenate user input into SQL strings. Implement input validation and WAF rules.',
-                                    references: ['https://owasp.org/www-community/attacks/SQL_Injection', 'CWE-89'],
-                                }));
-                                break; // One finding per param
-                            }
-                        } catch {
-                            // Request failed
-                        }
-                    }
-                }
+                parsedUrl = new URL(page.url);
             } catch {
-                // URL parsing failed
+                continue;
+            }
+
+            // Params present on this URL + discovered candidates (capped).
+            const existing = [...parsedUrl.searchParams.keys()];
+            const paramsToTest = [...new Set([...existing, ...this._candidateParams])].slice(0, 30);
+            if (paramsToTest.length === 0) continue;
+
+            for (const param of paramsToTest) {
+                // 1. Error-based detection
+                const errorFinding = await this._errorBasedTest(page.url, param);
+                if (errorFinding) {
+                    this.findings.push(errorFinding);
+                    continue; // confirmed — no need for blind tests on this param
+                }
+
+                // 2. Boolean-based blind detection
+                const boolFinding = await this._booleanBlindTest(page.url, param);
+                if (boolFinding) {
+                    this.findings.push(boolFinding);
+                    continue;
+                }
+
+                // 3. Time-based blind detection (budgeted — each adds ~5s)
+                if (this._timeBudget > 0) {
+                    const timeFinding = await this._timeBlindTest(page.url, param);
+                    if (timeFinding) this.findings.push(timeFinding);
+                }
             }
         }
+    }
+
+    /**
+     * Error-based detection: inject diagnostic payloads and look for DB errors.
+     */
+    async _errorBasedTest(baseUrl, param) {
+        for (const { name, payload } of SQLiProber.SQL_PAYLOADS.slice(0, 4)) {
+            let testUrl;
+            try {
+                testUrl = new URL(baseUrl);
+            } catch {
+                return null;
+            }
+            testUrl.searchParams.set(param, payload);
+
+            try {
+                const resp = await fetch(testUrl.toString(), {
+                    signal: AbortSignal.timeout(10000),
+                    redirect: 'follow',
+                });
+                const body = await resp.text();
+                const errorMatch = this._detectSQLError(body);
+                if (errorMatch) {
+                    return createFinding({
+                        module: 'security',
+                        title: `SQL Injection: ${param} parameter (${name})`,
+                        severity: 'critical',
+                        affected_surface: baseUrl,
+                        description: `The URL parameter "${param}" appears vulnerable to SQL injection. The "${name}" payload triggered a database error in the response, indicating unsanitized input is being passed directly to SQL queries.\n\nError signature: ${errorMatch}`,
+                        reproduction: [
+                            `1. Navigate to: ${testUrl.toString()}`,
+                            `2. Observe database error message in the response`,
+                            `3. Error signature: ${errorMatch}`,
+                        ],
+                        evidence: JSON.stringify({ param, payload: name, errorSignature: errorMatch, responseSnippet: body.substring(0, 300) }),
+                        remediation: 'Use parameterized queries (prepared statements) for all database operations. Never concatenate user input into SQL strings. Implement input validation and WAF rules.',
+                        references: ['https://owasp.org/www-community/attacks/SQL_Injection', 'CWE-89'],
+                    });
+                }
+            } catch {
+                // Request failed — try next payload
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Boolean-based blind detection: compare a logically-TRUE condition response
+     * against a logically-FALSE one. If TRUE behaves like the baseline while
+     * FALSE diverges, the input is being evaluated inside a SQL query.
+     */
+    async _booleanBlindTest(baseUrl, param) {
+        const baseValue = this._baseValueFor(baseUrl, param);
+
+        const baseline = await this._fetchVariant(baseUrl, param, baseValue);
+        if (!baseline) return null;
+
+        for (const pair of SQLiProber.BOOLEAN_PAIRS) {
+            const trueResp = await this._fetchVariant(baseUrl, param, baseValue + pair.truePayload);
+            const falseResp = await this._fetchVariant(baseUrl, param, baseValue + pair.falsePayload);
+            if (!trueResp || !falseResp) continue;
+
+            // Skip if either variant produced a hard error page (covered elsewhere).
+            const simTrueBase = this._similarity(trueResp, baseline);
+            const simTrueFalse = this._similarity(trueResp, falseResp);
+
+            const statusDivergence = trueResp.status !== falseResp.status;
+
+            // TRUE ≈ baseline, but TRUE clearly differs from FALSE → boolean blind.
+            const booleanSignal =
+                (simTrueBase >= 0.95 && simTrueFalse <= 0.85) || statusDivergence;
+
+            if (booleanSignal) {
+                // Confirm by repeating once to reduce false positives from jitter.
+                const trueResp2 = await this._fetchVariant(baseUrl, param, baseValue + pair.truePayload);
+                const falseResp2 = await this._fetchVariant(baseUrl, param, baseValue + pair.falsePayload);
+                const confirmed = trueResp2 && falseResp2 &&
+                    ((this._similarity(trueResp2, baseline) >= 0.95 && this._similarity(trueResp2, falseResp2) <= 0.85) ||
+                        trueResp2.status !== falseResp2.status);
+
+                if (!confirmed) continue;
+
+                return createFinding({
+                    module: 'security',
+                    title: `Blind SQL Injection (Boolean): ${param} parameter`,
+                    severity: 'critical',
+                    affected_surface: baseUrl,
+                    description: `The URL parameter "${param}" appears vulnerable to boolean-based blind SQL injection. A logically-true condition (${pair.truePayload}) returned a response matching the baseline, while a logically-false condition (${pair.falsePayload}) produced a measurably different response — indicating the input is evaluated within a SQL query even though no error is shown.`,
+                    reproduction: [
+                        `1. Request with ${param}=${baseValue}${pair.truePayload} (TRUE condition)`,
+                        `2. Request with ${param}=${baseValue}${pair.falsePayload} (FALSE condition)`,
+                        `3. Compare responses — TRUE matches baseline, FALSE diverges`,
+                    ],
+                    evidence: JSON.stringify({
+                        param,
+                        context: pair.context,
+                        truePayload: pair.truePayload,
+                        falsePayload: pair.falsePayload,
+                        simTrueVsBaseline: Number(simTrueBase.toFixed(3)),
+                        simTrueVsFalse: Number(simTrueFalse.toFixed(3)),
+                        trueStatus: trueResp.status,
+                        falseStatus: falseResp.status,
+                    }),
+                    remediation: 'Use parameterized queries (prepared statements). Boolean-based blind SQLi is exploitable even without visible errors — apply strict input validation and least-privilege DB accounts.',
+                    references: ['https://owasp.org/www-community/attacks/Blind_SQL_Injection', 'CWE-89'],
+                });
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Time-based blind detection: inject a sleep payload and measure the delay.
+     */
+    async _timeBlindTest(baseUrl, param) {
+        const baseValue = this._baseValueFor(baseUrl, param);
+
+        // Establish a control latency (fastest of two benign requests).
+        const c1 = await this._timeVariant(baseUrl, param, baseValue);
+        const c2 = await this._timeVariant(baseUrl, param, baseValue);
+        if (c1 === null && c2 === null) return null;
+        const control = Math.min(...[c1, c2].filter(t => t !== null));
+
+        const sleepMs = SQLiProber.SLEEP_SECONDS * 1000;
+        const threshold = control + sleepMs - 1500; // allow ~1.5s slack
+
+        for (const { db, payload } of SQLiProber.TIME_PAYLOADS) {
+            if (this._timeBudget <= 0) break;
+            this._timeBudget--;
+
+            const delayed = await this._timeVariant(baseUrl, param, baseValue + payload);
+            if (delayed === null) continue;
+
+            if (delayed >= threshold) {
+                // Confirm once more to rule out a transient slow response.
+                const confirm = await this._timeVariant(baseUrl, param, baseValue + payload);
+                if (confirm === null || confirm < threshold) continue;
+
+                return createFinding({
+                    module: 'security',
+                    title: `Blind SQL Injection (Time-based): ${param} parameter`,
+                    severity: 'critical',
+                    affected_surface: baseUrl,
+                    description: `The URL parameter "${param}" appears vulnerable to time-based blind SQL injection. A ${db} sleep payload caused the response to be delayed by ~${SQLiProber.SLEEP_SECONDS}s relative to a ${(control / 1000).toFixed(1)}s control, indicating the injected SQL was executed.`,
+                    reproduction: [
+                        `1. Baseline request with ${param}=${baseValue} (~${(control / 1000).toFixed(1)}s)`,
+                        `2. Inject ${param}=${baseValue}${payload}`,
+                        `3. Response is delayed by ~${SQLiProber.SLEEP_SECONDS}s (measured ${(delayed / 1000).toFixed(1)}s)`,
+                    ],
+                    evidence: JSON.stringify({
+                        param,
+                        engine: db,
+                        payload,
+                        controlMs: control,
+                        delayedMs: delayed,
+                        thresholdMs: threshold,
+                    }),
+                    remediation: 'Use parameterized queries (prepared statements). Time-based blind SQLi confirms code execution in the database — enforce input validation, query timeouts, and least-privilege DB accounts.',
+                    references: ['https://owasp.org/www-community/attacks/Blind_SQL_Injection', 'CWE-89'],
+                });
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Choose a base value to graft payloads onto: the existing param value if
+     * present, otherwise a benign numeric default.
+     */
+    _baseValueFor(baseUrl, param) {
+        try {
+            const u = new URL(baseUrl);
+            const v = u.searchParams.get(param);
+            if (v && v.length > 0) return v;
+        } catch {
+            /* ignore */
+        }
+        return '1';
+    }
+
+    /**
+     * Fetch a URL variant with `param` set to `value`. Returns { status, body }.
+     */
+    async _fetchVariant(baseUrl, param, value) {
+        let testUrl;
+        try {
+            testUrl = new URL(baseUrl);
+        } catch {
+            return null;
+        }
+        testUrl.searchParams.set(param, value);
+        try {
+            const resp = await fetch(testUrl.toString(), {
+                signal: AbortSignal.timeout(10000),
+                redirect: 'follow',
+            });
+            const body = await resp.text();
+            return { status: resp.status, body };
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * Measure the round-trip time (ms) for a URL variant. Returns null on error.
+     */
+    async _timeVariant(baseUrl, param, value) {
+        let testUrl;
+        try {
+            testUrl = new URL(baseUrl);
+        } catch {
+            return null;
+        }
+        testUrl.searchParams.set(param, value);
+        const start = Date.now();
+        try {
+            const resp = await fetch(testUrl.toString(), {
+                // Generous timeout so the sleep payload can complete.
+                signal: AbortSignal.timeout((SQLiProber.SLEEP_SECONDS + 8) * 1000),
+                redirect: 'follow',
+            });
+            await resp.text();
+            return Date.now() - start;
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * Similarity between two responses based on status + body length.
+     * Returns 0..1 (1 = identical-ish).
+     */
+    _similarity(a, b) {
+        if (!a || !b) return 0;
+        if (a.status !== b.status) return 0;
+        const la = a.body?.length || 0;
+        const lb = b.body?.length || 0;
+        if (la === 0 && lb === 0) return 1;
+        return 1 - Math.abs(la - lb) / Math.max(la, lb, 1);
     }
 
     /**

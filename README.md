@@ -14,9 +14,13 @@ JAKU crawls your entire app, generates test cases, probes for security vulnerabi
 - [Architecture](#architecture)
 - [Module 01 — QA & Functional Testing](#module-01--qa--functional-testing)
 - [Module 02 — Security Vulnerability Scanning](#module-02--security-vulnerability-scanning)
+- [Module 03 — Business Logic Validation](#module-03--business-logic-validation)
 - [Module 04 — Prompt Injection & AI Abuse Detection](#module-04--prompt-injection--ai-abuse-detection)
+- [Module 05 — API & Auth Flow Verification](#module-05--api--auth-flow-verification)
 - [Correlation Engine](#correlation-engine)
 - [CLI Reference](#cli-reference)
+- [Safety Modes](#safety-modes)
+- [LLM Augmentation (optional)](#llm-augmentation-optional)
 - [Reports](#reports)
 - [Severity Framework](#severity-framework)
 - [Configuration](#configuration)
@@ -78,7 +82,7 @@ JAKU is a **multi-agent system** — a central Orchestrator coordinates 6 specia
 |-------|------|-------------|---------|
 | **JAKU-CRAWL** | Surface discovery | — | Wave 1 (solo) |
 | **JAKU-QA** | QA & functional testing (5 sub-modules) | JAKU-CRAWL | Wave 2 (parallel) |
-| **JAKU-SEC** | Security vulnerability scanning (8 sub-modules) | JAKU-CRAWL | Wave 2 (parallel) |
+| **JAKU-SEC** | Security vulnerability scanning (15 sub-modules) | JAKU-CRAWL | Wave 2 (parallel) |
 | **JAKU-AI** | Prompt injection & AI abuse (8 sub-modules) | JAKU-CRAWL | Wave 2 (parallel) |
 | **JAKU-LOGIC** | Business logic validation (6 sub-modules) | JAKU-CRAWL | Wave 2 (parallel) |
 | **JAKU-API** | API & auth flow verification (5 sub-modules) | JAKU-CRAWL | Wave 2 (parallel) |
@@ -213,19 +217,34 @@ node src/cli.js qa https://your-app.dev --verbose
 
 ## Module 02 — Security Vulnerability Scanning
 
-Probes your app's attack surface with safe, non-destructive payloads.
+Probes your app's attack surface. Under the default `--safe-active` mode these
+checks use detection-only payloads and do not issue state-changing requests
+(see [Safety Modes](#safety-modes)).
 
 | Sub-Module | What It Does |
 |-----------|-------------|
 | **Header Analyzer** | Checks CSP, HSTS, X-Frame-Options, X-Content-Type-Options, CORS, Referrer-Policy, Permissions-Policy, and technology fingerprinting |
 | **Secret Detector** | Scans page source, JS, and inline scripts for 19 secret patterns (AWS, Google, Stripe, GitHub, Slack, Firebase, JWT, DB URLs, private keys). Probes 21 sensitive paths (`.env`, `.git/config`, `/debug`, `/actuator`). Checks for source map exposure |
-| **XSS Scanner** | Tests URL parameters and form inputs for reflected and stored XSS using 9 detection-only payloads |
-| **SQLi Prober** | Tests URL params, form inputs, and API endpoints with 8 SQL and 3 NoSQL payloads. Detects 18 database error signatures |
+| **XSS Scanner** | Tests URL parameters and form inputs for reflected and stored XSS using 9 detection-only payloads (parameters are discovered from forms/links/APIs, with a fallback name list) |
+| **SQLi Prober** | Tests URL params, form inputs, and API endpoints with SQL and NoSQL payloads. Detects 18 database error signatures plus boolean-based and time-based blind injection |
 | **Dependency Auditor** | Runs `npm audit`, maps CVE advisories to JAKU severity, checks for unpinned dependencies and risky npm scripts |
 | **TLS Checker** | Validates certificate expiry, detects self-signed certs, checks HTTP→HTTPS redirect, and scans for mixed content |
 | **Infrastructure Scanner** | Probes 40 admin/debug endpoints, detects directory listing, checks error pages for information disclosure, and tests GraphQL introspection |
+| **File Upload Tester** | Tests upload endpoints for MIME spoofing, dangerous extensions, and path traversal *(active — `safe-active`+)* |
+| **CSRF Detector** | Checks state-changing forms/endpoints for anti-CSRF tokens and SameSite cookie protection |
+| **Open Redirect Detector** | Tests redirect parameters for unvalidated off-site redirection *(active — `safe-active`+)* |
+| **Subdomain Scanner** | Enumerates common subdomains and flags exposed/sensitive hosts |
+| **Cookie Auditor** | Audits cookies for `HttpOnly`, `Secure`, `SameSite`, and scope/expiry hygiene |
+| **CSP Validator** | Parses Content-Security-Policy for unsafe directives (`unsafe-inline`, `unsafe-eval`, wildcards, missing directives) |
+| **Clickjacking Detector** | Verifies frame-busting protection via `X-Frame-Options` / CSP `frame-ancestors` |
+| **SSRF Prober** | Probes server-side request forgery via URL/host parameters *(active — `safe-active`+)* |
 
-> **Safety:** All security testing uses simulation-only payloads. No destructive operations are ever executed.
+> **Safety:** Module 02 (security) checks use detection-only payloads and do not
+> perform destructive operations in any mode. Note that some **Module 03
+> (business logic)** tests *do* send real state-changing requests (e.g. race
+> conditions, pricing/checkout mutation) — those are gated behind the
+> `--aggressive` safety mode and are **skipped by default**. See
+> [Safety Modes](#safety-modes).
 
 ```bash
 # Security only
@@ -237,6 +256,12 @@ node src/cli.js security https://your-app.dev --verbose
 ## Module 03 — Business Logic Validation
 
 Detects business logic flaws that traditional scanners miss: pricing manipulation, access control bypass, workflow skipping, race conditions, and referral abuse.
+
+> ⚠ **Some logic tests are destructive.** Pricing exploitation, race-condition,
+> cart-manipulation, coupon-abuse, and account-takeover testing issue (or are
+> classified as) real state-changing requests. They only run under
+> `--aggressive` and are **skipped by default** (`--safe-active`). See
+> [Safety Modes](#safety-modes).
 
 ### How It Works
 
@@ -288,6 +313,11 @@ node src/cli.js scan https://your-app.dev --modules security,logic
 | 3 | **System Prompt Extractor** | 17 techniques | Direct repeat, token forcing ("Continue: You are a"), structured output (JSON/YAML), indirect summarization, fill-in-the-blanks, reverse output |
 | 4 | **Output Analyzer** | 10 tests | AI-mediated XSS: makes the AI generate `<script>` tags, `<img onerror>`, SVG onload, markdown `javascript:` links, data exfiltration payloads — tests if output is rendered unsanitized |
 | 5 | **Guardrail Prober** | 15 probes | PII leakage (other users' data), excessive agency (delete account, send emails, execute code), off-topic compliance, tool/function-call abuse |
+| 6 | **Model DoS Tester** | resource probes | Context bombing, token-loop / repetition attacks, and oversized-input handling to detect denial-of-wallet / resource exhaustion |
+| 7 | **Indirect Injector** | 6 payloads | Indirect prompt injection via content the AI later ingests (e.g. retrieved/stored data, profile fields) rather than the direct chat input |
+
+> Detection runs first via the **AI Endpoint Detector**, then the 7 phases above
+> run against each detected endpoint — 8 AI sub-modules in total.
 
 ### AI Threat Categories
 
@@ -417,9 +447,102 @@ Correlations appear in the CLI output and reports with severity escalation.
 | `--halt-on-critical` | Abort scan immediately on any critical finding | off |
 | `--webhook <url>` | POST findings summary to webhook URL on completion | off |
 | `--prod-safe` | Confirm authorization to scan production targets | off |
+| `--passive` | Safety mode: recon + static analysis only (no attack probing) | — |
+| `--safe-active` | Safety mode: non-destructive active probing | **default** |
+| `--aggressive` | Safety mode: enable destructive/state-changing tests | — |
+| `--llm` | Enable optional LLM augmentation (key from env) | off |
+| `--llm-provider <name>` | LLM provider: `openai` or `anthropic` | `openai` |
+| `--llm-model <id>` | LLM model id | provider default |
+| `--llm-consent` | Consent to send minimal finding/target data to the provider | off |
 | `--json` | Output JSON report | off |
 | `--html` | Output HTML report | off |
 | `-v, --verbose` | Enable verbose logging | off |
+
+### Safety Modes
+
+JAKU exposes three explicit safety tiers so you control how invasive a scan is.
+The default is `--safe-active`. You can also set `"safety_mode"` in
+`jaku.config.json`; the CLI flag takes precedence.
+
+| Mode | Flag | What runs | What it never does |
+|------|------|-----------|--------------------|
+| **Passive** | `--passive` | Crawl/discovery + read-only/static analysis only (headers, secrets, TLS, cookies, CSP, clickjacking, static form/API analysis) | Sends no attack payloads and no state-changing requests. Active probers (XSS, SQLi, infra, SSRF, file-upload, open-redirect, AI, API/auth, and all logic tests) are skipped. |
+| **Safe-Active** *(default)* | `--safe-active` | Everything in passive **plus** non-destructive active probing: XSS/SQLi probes, AI prompt-injection, API/auth verification, and non-destructive logic checks (access boundary, workflow, abuse patterns, email enumeration, feature flags) | Never issues destructive/state-changing requests. Destructive logic tests are skipped with a clear log line. |
+| **Aggressive** | `--aggressive` | Everything in safe-active **plus** destructive/state-changing tests: pricing exploitation, race conditions, cart manipulation, coupon abuse, account takeover | — (use only against environments you are authorized to mutate) |
+
+> JAKU is a security scanner and **intentionally does not honor `robots.txt`** in
+> any mode. The legacy `respect_robots` / `respect_robots_txt` config key has
+> been removed.
+
+### LLM Augmentation (optional)
+
+JAKU can optionally use your **own** LLM API key to make scans smarter. This
+feature is **off by default and strictly additive** — with no key, no `--llm`
+flag, no consent, an unreachable API, or an exhausted budget, JAKU behaves
+**exactly** as it does without it. The LLM **never** decides core pass/fail;
+deterministic scanners always own the verdict.
+
+**What the LLM adds (all advisory / tagged `source: "llm"`):**
+
+| Phase | Augmentation | Where |
+|-------|--------------|-------|
+| 0 | Framework-specific remediation guidance + executive summary | reports |
+| 1 | Context-aware prompt-injection payloads tailored to a leaked system prompt | `JAKU-AI` |
+| 2 | False-positive triage of borderline findings + attack-chain narrative enrichment | synthesis + reports |
+| 3 | Extra business-domain / invariant inference | `JAKU-LOGIC` |
+
+**Enabling it:**
+
+```bash
+# Key comes ONLY from the environment — never the config file or CLI
+export OPENAI_API_KEY=sk-...            # or ANTHROPIC_API_KEY=sk-ant-...
+
+node src/cli.js scan https://myapp.dev --llm --llm-consent --llm-provider openai
+```
+
+Both `--llm` (enablement) **and** `--llm-consent` (or `llm.consent: true`) are
+required before any data leaves your machine. Configure non-secret settings in
+`jaku.config.json`:
+
+```jsonc
+"llm": {
+  "enabled": false,        // or pass --llm
+  "provider": "openai",    // openai | anthropic
+  "model": null,           // null → cheap provider default
+  "max_tokens": 1024,      // per-call output cap
+  "max_calls": 50,         // per-scan call budget
+  "token_budget": 100000,  // per-scan token budget
+  "timeout_seconds": 30,
+  "consent": false,        // or pass --llm-consent
+  "base_url": null         // optional self-hosted/proxy endpoint
+}
+```
+
+**What data leaves the machine (data minimization):**
+
+- *Remediation:* finding title, module, severity, description.
+- *Triage:* title, severity, description, a short evidence snippet — borderline findings only.
+- *Executive summary:* severity counts + finding **titles** (no bodies/evidence).
+- *Payload generation:* a snippet of the **already-leaked** system prompt + the target host.
+- *Business inference:* discovered URL **paths** + form field **names** (no values, no bodies).
+
+**Security & safety guarantees:**
+
+- **Keys never persist or print.** The API key is read from the environment only,
+  is never written to config, logs, reports, `meta`, `finding.evidence`, or PR
+  comments. The logger scrubs `sk-…`, `Bearer …`, and `x-api-key` patterns from
+  all output. Putting an `api_key` in `jaku.config.json` is rejected with a warning.
+- **Passive mode = no egress.** Third-party calls are auto-disabled in `--passive`.
+- **Safety-tier gating.** LLM-generated **destructive** payloads only fire under
+  `--aggressive`; non-destructive generated probes require `--safe-active`.
+- **Budgeted & resilient.** Per-scan call/token budgets, per-call timeout,
+  429 backoff, and a connection-failure circuit breaker — any failure degrades
+  silently to deterministic behavior.
+- **No new dependencies.** Uses the built-in `fetch` only.
+
+To disable, simply omit `--llm` (or set `"enabled": false`). In CI, set
+`enable-llm: 'true'` on the action and provide `OPENAI_API_KEY` /
+`ANTHROPIC_API_KEY` from repository secrets in the job environment.
 
 ### Report Formats
 
@@ -467,12 +590,14 @@ node src/cli.js ai https://myapp.dev/api/chat --max-pages 1 -v
 ```
   ╦╔═╗╦╔═╦ ╦
   ║╠═╣╠╩╗║ ║  呪 Autonomous Security & Quality Intelligence
- ╚╝╩ ╩╩ ╩╚═╝  v1.0.3 · Multi-Agent
+ ╚╝╩ ╩╩ ╩╚═╝  v1.2.0 · Multi-Agent
 
   Target:  https://your-app.dev
   Modules: QA + SECURITY + AI
   Mode:    Multi-Agent Orchestration
+  Safety:  Safe-Active (non-destructive probing)
   Severity: ≥ low
+  LLM:     disabled — not enabled (set llm.enabled or pass --llm)
 
   ✔ [JAKU-CRAWL] Complete — 0 findings in 2.1s
   ✔ [JAKU-QA] Complete — 3 findings in 14.9s      ⚡parallel
@@ -505,13 +630,16 @@ node src/cli.js ai https://myapp.dev/api/chat --max-pages 1 -v
 
 ## Reports
 
-Every scan generates three report formats, saved to `jaku-reports/<timestamp>/`:
+Every scan generates the following report formats, saved to `jaku-reports/<timestamp>/`:
 
 | Format | File | Description |
 |--------|------|-------------|
 | **JSON** | `report.json` | Machine-readable findings array for CI/CD integration |
 | **Markdown** | `report.md` | Human-readable narrative with severity tables and finding details |
 | **HTML** | `report.html` | Self-contained dark-themed report with severity charts, filters, and embedded evidence |
+| **SARIF** | `report.sarif` | GitHub/GitLab Security Dashboard integration (SARIF v2.1.0) |
+| **Diff** | `diff-report.md` / `diff-report.json` | Regression detection vs. the previous scan run |
+| **OWASP Compliance** | `compliance-owasp.*` | OWASP Top 10 pass/fail report (JSON + MD + HTML) — only with `--compliance owasp` |
 
 ### Finding Schema
 
@@ -536,7 +664,7 @@ Every scan generates three report formats, saved to `jaku-reports/<timestamp>/`:
 }
 ```
 
-Modules tag findings as: `qa`, `security`, or `ai`.
+Modules tag findings as: `qa`, `security`, `ai`, `logic`, or `api`.
 
 ---
 
@@ -563,33 +691,48 @@ cp jaku.config.example.json jaku.config.json
 ```json
 {
   "target_url": "https://your-app.dev",
-  "credentials": {
-    "username": "",
-    "password": ""
-  },
-  "modules": ["qa", "security", "ai"],
+  "modules_enabled": ["qa", "security", "ai", "logic", "api"],
   "severity_threshold": "low",
+  "safety_mode": "safe-active",
   "halt_on_critical": true,
   "crawler": {
     "max_pages": 50,
     "max_depth": 5,
-    "respect_robots": true
+    "concurrency": 4
+  },
+  "llm": {
+    "enabled": false,
+    "provider": "openai",
+    "consent": false
   }
 }
 ```
+
+> The LLM API key is **never** stored in this file — it is read from the
+> `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` environment variable only. See
+> [LLM Augmentation](#llm-augmentation-optional).
+
+Unknown, mistyped, or deprecated keys in `jaku.config.json` are reported as
+warnings on load (and ignored) rather than silently honored.
 
 ### Configuration Options
 
 | Key | Type | Description |
 |-----|------|-------------|
 | `target_url` | string | The application URL to scan |
-| `credentials` | object | Login credentials for authenticated scanning |
-| `modules` | string[] | Modules to enable: `qa`, `security`, `ai` |
+| `credentials` | object[] | Login credentials for authenticated scanning |
+| `modules_enabled` | string[] | Modules to enable: `qa`, `security`, `ai`, `logic`, `api` |
 | `severity_threshold` | string | Minimum severity to report: `critical`, `high`, `medium`, `low` |
+| `safety_mode` | string | Safety tier: `passive`, `safe-active` (default), `aggressive` — see [Safety Modes](#safety-modes) |
 | `halt_on_critical` | boolean | Exit with code 1 if critical findings detected (for CI/CD) |
 | `crawler.max_pages` | number | Maximum pages to crawl |
 | `crawler.max_depth` | number | Maximum link depth to follow |
-| `crawler.respect_robots` | boolean | Honor robots.txt directives |
+| `crawler.concurrency` | number | Parallel crawl workers |
+| `llm.enabled` | boolean | Enable optional LLM augmentation (default `false`) — see [LLM Augmentation](#llm-augmentation-optional) |
+| `llm.provider` | string | `openai` or `anthropic` |
+| `llm.model` | string | Model id (provider default if omitted) |
+| `llm.consent` | boolean | Required (with enablement) before any data egress |
+| `llm.max_calls` / `llm.token_budget` | number | Per-scan call / token budgets |
 
 ### CI/CD Integration
 

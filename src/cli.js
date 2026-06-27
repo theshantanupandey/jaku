@@ -14,11 +14,15 @@ import { APIAgent } from './agents/api-agent.js';
 import { ReportGenerator } from './reporting/report-generator.js';
 import { ComplianceReporter } from './reporting/compliance-reporter.js';
 import { AuthManager } from './core/auth-manager.js';
+import { getVersion } from './utils/version.js';
+import { LLMClient } from './core/llm/llm-client.js';
+
+const VERSION = getVersion();
 
 const BANNER = `
 ${chalk.hex('#00ff88').bold('  ╦╔═╗╦╔═╦ ╦')}
 ${chalk.hex('#00ff88').bold('  ║╠═╣╠╩╗║ ║')}  ${chalk.dim('呪 Autonomous Security & Quality Intelligence')}
-${chalk.hex('#00ff88').bold(' ╚╝╩ ╩╩ ╩╚═╝')}  ${chalk.dim('v1.0.3 · Multi-Agent')}
+${chalk.hex('#00ff88').bold(' ╚╝╩ ╩╩ ╩╚═╝')}  ${chalk.dim(`v${VERSION} · Multi-Agent`)}
 `;
 
 const program = new Command();
@@ -26,7 +30,7 @@ const program = new Command();
 program
     .name('jaku')
     .description('JAKU (呪) — Autonomous QA & Security scanning agent for vibe-coded apps')
-    .version('1.0.3');
+    .version(VERSION);
 
 // ═══════════════════════════════════════════════
 // Multi-Agent Scan Runner
@@ -91,10 +95,25 @@ async function runScan(url, options, modulesToRun) {
     const runAPI = modulesToRun.includes('api');
     const moduleLabel = modulesToRun.join(' + ').toUpperCase();
 
+    const safetyLabels = {
+        passive: 'Passive (recon + static analysis only)',
+        'safe-active': 'Safe-Active (non-destructive probing)',
+        aggressive: 'Aggressive (includes destructive tests)',
+    };
+
     console.log(chalk.hex('#00ff88')('  Target:  ') + chalk.white(url));
     console.log(chalk.hex('#00ff88')('  Modules: ') + chalk.white(moduleLabel));
     console.log(chalk.hex('#00ff88')('  Mode:    ') + chalk.white('Multi-Agent Orchestration'));
+    console.log(chalk.hex('#00ff88')('  Safety:  ') + chalk.white(safetyLabels[config.safety_mode] || config.safety_mode));
     console.log(chalk.hex('#00ff88')('  Severity:') + chalk.white(` ≥ ${config.severity_threshold}`));
+
+    // Single startup line stating whether LLM augmentation is active (no secrets).
+    const llmStatus = LLMClient.describe(config);
+    const llmActive = llmStatus.startsWith('enabled');
+    console.log(
+        chalk.hex('#00ff88')('  LLM:     ') +
+        (llmActive ? chalk.cyan(llmStatus) : chalk.dim(llmStatus))
+    );
     console.log();
 
     // ═══════════════════════════════════════
@@ -213,7 +232,7 @@ async function runScan(url, options, modulesToRun) {
 
     try {
         const duration = Date.now() - startTime;
-        const reporter = new ReportGenerator(config, logger);
+        const reporter = new ReportGenerator(config, logger, orchestrator.llmClient);
 
         const testSummary = qaAgent?.testSummary || {};
 
@@ -224,6 +243,7 @@ async function runScan(url, options, modulesToRun) {
             testSummary: { ...testSummary, duration },
             surfaceInventory: results.surfaceInventory,
             outputDir: config.output_dir,
+            modules: modulesToRun,
         });
 
         // Generate compliance report if requested
@@ -234,7 +254,7 @@ async function runScan(url, options, modulesToRun) {
                 options.compliance,
                 results.findings,
                 reportDir,
-                { target: url, version: '1.0.3', scannedAt: new Date().toISOString() }
+                { target: url, version: VERSION, scannedAt: new Date().toISOString() }
             );
         }
 
@@ -321,12 +341,12 @@ async function runScan(url, options, modulesToRun) {
 
 program
     .command('scan')
-    .description('Run JAKU scan with selected modules (default: qa + security)')
+    .description('Run JAKU scan with selected modules (default: qa + security + ai + logic + api)')
     .argument('<url>', 'Target URL to scan')
     .option('-c, --config <path>', 'Path to jaku.config.json')
     .option('-o, --output <dir>', 'Output directory for reports')
     .option('-m, --modules <list>', 'Comma-separated modules to run (qa,security,ai,logic,api)', 'qa,security,ai,logic,api')
-    .option('-s, --severity <level>', 'Minimum severity threshold (critical|high|medium|low)', 'low')
+    .option('-s, --severity <level>', 'Minimum severity threshold (critical|high|medium|low|info)', 'low')
     .option('--profile <type>', 'Scan profile: quick|deep|ci (overrides crawl settings)')
     .option('--compliance <framework>', 'Generate compliance report (owasp)')
     .option('--json', 'Output JSON report')
@@ -336,6 +356,13 @@ program
     .option('--halt-on-critical', 'Abort scan immediately on critical finding')
     .option('--webhook <url>', 'POST findings to webhook URL on completion')
     .option('--prod-safe', 'Confirm authorization to scan production targets')
+    .option('--passive', 'Safety mode: recon + static analysis only (no attack probing)')
+    .option('--safe-active', 'Safety mode: non-destructive active probing (default)')
+    .option('--aggressive', 'Safety mode: enable destructive/state-changing tests')
+    .option('--llm', 'Enable optional LLM augmentation (key from env; default off)')
+    .option('--llm-provider <name>', 'LLM provider: openai|anthropic')
+    .option('--llm-model <id>', 'LLM model id (provider default if omitted)')
+    .option('--llm-consent', 'Consent to send minimal finding/target data to the LLM provider')
     .option('--auth-strategy <type>', 'Auth strategy: auto|form|api|cookie (default: auto)')
     .option('--login-url <url>', 'Login page URL for form-based auth')
     .option('--username <user>', 'Username/email for authenticated scanning')
@@ -355,6 +382,13 @@ program
     .option('-s, --severity <level>', 'Severity threshold', 'low')
     .option('--max-pages <n>', 'Maximum pages to crawl', '50')
     .option('--max-depth <n>', 'Maximum crawl depth', '5')
+    .option('--passive', 'Safety mode: recon + static analysis only (no attack probing)')
+    .option('--safe-active', 'Safety mode: non-destructive active probing (default)')
+    .option('--aggressive', 'Safety mode: enable destructive/state-changing tests')
+    .option('--llm', 'Enable optional LLM augmentation (key from env; default off)')
+    .option('--llm-provider <name>', 'LLM provider: openai|anthropic')
+    .option('--llm-model <id>', 'LLM model id (provider default if omitted)')
+    .option('--llm-consent', 'Consent to send minimal finding/target data to the LLM provider')
     .option('-v, --verbose', 'Enable verbose logging')
     .action(async (url, options) => {
         await runScan(url, options, ['qa']);
@@ -369,6 +403,13 @@ program
     .option('-s, --severity <level>', 'Severity threshold', 'low')
     .option('--max-pages <n>', 'Maximum pages to crawl', '50')
     .option('--max-depth <n>', 'Maximum crawl depth', '5')
+    .option('--passive', 'Safety mode: recon + static analysis only (no attack probing)')
+    .option('--safe-active', 'Safety mode: non-destructive active probing (default)')
+    .option('--aggressive', 'Safety mode: enable destructive/state-changing tests')
+    .option('--llm', 'Enable optional LLM augmentation (key from env; default off)')
+    .option('--llm-provider <name>', 'LLM provider: openai|anthropic')
+    .option('--llm-model <id>', 'LLM model id (provider default if omitted)')
+    .option('--llm-consent', 'Consent to send minimal finding/target data to the LLM provider')
     .option('-v, --verbose', 'Enable verbose logging')
     .action(async (url, options) => {
         await runScan(url, options, ['security']);
@@ -383,6 +424,13 @@ program
     .option('-s, --severity <level>', 'Severity threshold', 'low')
     .option('--max-pages <n>', 'Maximum pages to crawl', '50')
     .option('--max-depth <n>', 'Maximum crawl depth', '5')
+    .option('--passive', 'Safety mode: recon + static analysis only (no attack probing)')
+    .option('--safe-active', 'Safety mode: non-destructive active probing (default)')
+    .option('--aggressive', 'Safety mode: enable destructive/state-changing tests')
+    .option('--llm', 'Enable optional LLM augmentation (key from env; default off)')
+    .option('--llm-provider <name>', 'LLM provider: openai|anthropic')
+    .option('--llm-model <id>', 'LLM model id (provider default if omitted)')
+    .option('--llm-consent', 'Consent to send minimal finding/target data to the LLM provider')
     .option('-v, --verbose', 'Enable verbose logging')
     .action(async (url, options) => {
         await runScan(url, options, ['ai']);
@@ -397,6 +445,13 @@ program
     .option('-s, --severity <level>', 'Severity threshold', 'low')
     .option('--max-pages <n>', 'Maximum pages to crawl', '50')
     .option('--max-depth <n>', 'Maximum crawl depth', '5')
+    .option('--passive', 'Safety mode: recon + static analysis only (no attack probing)')
+    .option('--safe-active', 'Safety mode: non-destructive active probing (default)')
+    .option('--aggressive', 'Safety mode: enable destructive/state-changing tests')
+    .option('--llm', 'Enable optional LLM augmentation (key from env; default off)')
+    .option('--llm-provider <name>', 'LLM provider: openai|anthropic')
+    .option('--llm-model <id>', 'LLM model id (provider default if omitted)')
+    .option('--llm-consent', 'Consent to send minimal finding/target data to the LLM provider')
     .option('-v, --verbose', 'Enable verbose logging')
     .action(async (url, options) => {
         await runScan(url, options, ['logic']);
@@ -411,6 +466,13 @@ program
     .option('-s, --severity <level>', 'Severity threshold', 'low')
     .option('--max-pages <n>', 'Maximum pages to crawl', '50')
     .option('--max-depth <n>', 'Maximum crawl depth', '5')
+    .option('--passive', 'Safety mode: recon + static analysis only (no attack probing)')
+    .option('--safe-active', 'Safety mode: non-destructive active probing (default)')
+    .option('--aggressive', 'Safety mode: enable destructive/state-changing tests')
+    .option('--llm', 'Enable optional LLM augmentation (key from env; default off)')
+    .option('--llm-provider <name>', 'LLM provider: openai|anthropic')
+    .option('--llm-model <id>', 'LLM model id (provider default if omitted)')
+    .option('--llm-consent', 'Consent to send minimal finding/target data to the LLM provider')
     .option('-v, --verbose', 'Enable verbose logging')
     .action(async (url, options) => {
         await runScan(url, options, ['api']);

@@ -215,6 +215,40 @@ export class PromptInjector {
     }
 
     /**
+     * Fire a set of LLM-generated payloads at AI surfaces (Phase 1).
+     * Each finding is tagged source:'llm'. Destructive generated payloads are
+     * only fired when allowDestructive is true (caller enforces safety tier).
+     */
+    async injectGenerated(aiSurfaces, generatedPayloads, { allowDestructive = false } = {}) {
+        const findings = [];
+        if (!Array.isArray(generatedPayloads) || generatedPayloads.length === 0) return findings;
+
+        for (const surface of aiSurfaces) {
+            if (surface.confidence === 'low') continue;
+
+            const baseline = await this._getBaseline(surface);
+            if (!baseline) continue;
+
+            for (const payload of generatedPayloads) {
+                if (payload.destructive && !allowDestructive) continue;
+                try {
+                    const result = await this._firePayload(surface, payload, baseline);
+                    if (result) {
+                        result.source = 'llm';
+                        result.title = `LLM-Generated ${result.title}`;
+                        findings.push(result);
+                    }
+                } catch (err) {
+                    this.logger?.debug?.(`Generated payload "${payload.name}" failed: ${err.message}`);
+                }
+            }
+        }
+
+        this.logger?.info?.(`Prompt Injector: ${findings.length} findings from ${generatedPayloads.length} LLM-generated payloads`);
+        return findings;
+    }
+
+    /**
      * Get a baseline response for comparison.
      */
     async _getBaseline(surface) {

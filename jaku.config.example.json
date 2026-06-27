@@ -16,6 +16,7 @@
         "api"
     ],
     "severity_threshold": "low",
+    "safety_mode": "safe-active",
     "halt_on_critical": false,
     "prod_safe": false,
     "notify_webhook": null,
@@ -23,7 +24,18 @@
         "max_depth": 5,
         "max_pages": 50,
         "timeout": 30000,
-        "respect_robots_txt": true
+        "concurrency": 4
+    },
+    "llm": {
+        "enabled": false,
+        "provider": "openai",
+        "model": null,
+        "max_tokens": 1024,
+        "max_calls": 50,
+        "token_budget": 100000,
+        "timeout_seconds": 30,
+        "consent": false,
+        "base_url": null
     },
     "viewports": {
         "mobile": {

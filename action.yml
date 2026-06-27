@@ -49,6 +49,18 @@ inputs:
     description: 'Maximum pages to crawl'
     required: false
     default: '50'
+  enable-llm:
+    description: 'Enable optional LLM augmentation (requires OPENAI_API_KEY or ANTHROPIC_API_KEY in job env and consent)'
+    required: false
+    default: 'false'
+  llm-provider:
+    description: 'LLM provider when enabled (openai|anthropic)'
+    required: false
+    default: 'openai'
+  llm-model:
+    description: 'LLM model id (provider default if empty)'
+    required: false
+    default: ''
   verbose:
     description: 'Enable verbose logging'
     required: false
@@ -102,6 +114,14 @@ runs:
         JAKU_AUTH_STRATEGY: ${{ inputs.auth-strategy }}
         JAKU_MAX_PAGES: ${{ inputs.max-pages }}
         JAKU_VERBOSE: ${{ inputs.verbose }}
+        JAKU_ENABLE_LLM: ${{ inputs.enable-llm }}
+        JAKU_LLM_PROVIDER: ${{ inputs.llm-provider }}
+        JAKU_LLM_MODEL: ${{ inputs.llm-model }}
+        # API keys are read from the job environment (set these from repo secrets
+        # in your workflow, e.g. OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}).
+        # They are passed to the scanner process only and never printed.
+        OPENAI_API_KEY: ${{ env.OPENAI_API_KEY }}
+        ANTHROPIC_API_KEY: ${{ env.ANTHROPIC_API_KEY }}
       run: |
         REPORT_DIR="${{ runner.temp }}/jaku-reports"
         
@@ -123,6 +143,17 @@ runs:
         
         if [ "${JAKU_VERBOSE}" = "true" ]; then
           CMD="${CMD} --verbose"
+        fi
+
+        # Optional LLM augmentation. Only enabled when explicitly requested AND a
+        # key is present in the environment. The key itself is never added to the
+        # command line — LLMClient reads it from env. --llm-consent is implied by
+        # the operator opting in via enable-llm in CI.
+        if [ "${JAKU_ENABLE_LLM}" = "true" ] && { [ -n "${OPENAI_API_KEY}" ] || [ -n "${ANTHROPIC_API_KEY}" ]; }; then
+          CMD="${CMD} --llm --llm-consent --llm-provider ${JAKU_LLM_PROVIDER}"
+          if [ -n "${JAKU_LLM_MODEL}" ]; then
+            CMD="${CMD} --llm-model ${JAKU_LLM_MODEL}"
+          fi
         fi
         
         # Run scan
@@ -217,7 +248,7 @@ runs:
               }
             }
             
-            body += '\n---\n*Scanned by [JAKU](https://github.com/jaku-security/jaku) v1.0.3*';
+            body += `\n---\n*Scanned by [JAKU](https://github.com/jaku-security/jaku) v${report.meta?.version || ''}*`;
           } else {
             body += '⚠️ Scan completed but no report was generated. Check workflow logs for errors.';
           }

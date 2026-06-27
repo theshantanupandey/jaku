@@ -1,5 +1,8 @@
 import { EventBus } from './event-bus.js';
 import { FindingsLedger } from './findings-ledger.js';
+import { getVersion } from '../utils/version.js';
+import { LLMClient } from '../core/llm/llm-client.js';
+import { enrichCorrelation, triageFinding } from '../core/llm/augmentations.js';
 
 /**
  * Orchestrator — Central coordinator for the JAKU multi-agent system.
@@ -18,6 +21,11 @@ export class Orchestrator {
         this.eventBus = new EventBus();
         this.ledger = new FindingsLedger(this.eventBus);
 
+        // Optional LLM augmentation client (default OFF). Constructed once and
+        // shared with all agents via context so any agent can opt in. Returns
+        // null on every call when disabled/unavailable → callers degrade.
+        this.llmClient = new LLMClient(config, logger);
+
         this._agents = new Map();       // name → agent instance
         this._sharedContext = {         // passed to all agents
             config,
@@ -25,6 +33,7 @@ export class Orchestrator {
             eventBus: this.eventBus,
             ledger: this.ledger,
             surfaceInventory: null,       // set by JAKU-CRAWL
+            llmClient: this.llmClient,    // optional; null-equivalent when disabled
         };
 
         this._startTime = null;
@@ -122,6 +131,10 @@ export class Orchestrator {
         // Synthesis phase
         const duration = Date.now() - this._startTime;
         const results = this._synthesize(duration);
+
+        // Optional LLM augmentation of synthesized results (additive, best-effort).
+        // The deterministic correlate()/dedup output above is the source of truth.
+        await this._llmAugment(results);
 
         this.eventBus.emit('scan:completed', {
             timestamp: new Date().toISOString(),
@@ -231,6 +244,48 @@ export class Orchestrator {
     }
 
     /**
+     * Phase 2 — LLM augmentation of synthesized results. STRICTLY ADDITIVE:
+     *   - Enriches attack-chain correlation narratives (keeps original as fallback).
+     *   - Triages borderline findings (advisory `llm_triage` note only; never
+     *     mutates the deterministic severity or pass/fail).
+     * No-op when the LLM client is disabled/over-budget (returns immediately).
+     */
+    async _llmAugment(results) {
+        const client = this.llmClient;
+        if (!client?.isEnabled?.()) return;
+
+        try {
+            // Enrich correlation narratives.
+            for (const c of results.correlations || []) {
+                const enriched = await enrichCorrelation(client, c);
+                if (enriched) {
+                    c.narrative_llm = enriched;
+                    c.narrative_source = 'llm';
+                }
+            }
+
+            // Triage borderline findings only (limit egress + budget).
+            const borderline = (results.deduplicated || results.findings || [])
+                .filter(f => this._isBorderline(f))
+                .slice(0, 15);
+            for (const f of borderline) {
+                const triage = await triageFinding(client, f);
+                if (triage) f.llm_triage = triage;
+            }
+        } catch (err) {
+            this.logger?.debug?.(`[LLM] augmentation skipped: ${err.message}`);
+        }
+    }
+
+    /** Heuristic: which findings are "borderline" and worth LLM triage. */
+    _isBorderline(f) {
+        if (!f) return false;
+        if (f.severity === 'medium' || f.severity === 'low') return true;
+        const text = `${f.title || ''} ${f.description || ''}`.toLowerCase();
+        return /\b(potential|possible|may|might|suspected|likely|reflected)\b/.test(text);
+    }
+
+    /**
      * Get the status of all agents.
      */
     getStatus() {
@@ -255,7 +310,7 @@ export class Orchestrator {
         try {
             const payload = {
                 agent: 'JAKU',
-                version: '1.0.3',
+                version: getVersion(),
                 target: this.config.target_url,
                 timestamp: new Date().toISOString(),
                 duration: results.duration,

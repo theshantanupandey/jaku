@@ -1,5 +1,6 @@
 import { chromium } from 'playwright';
 import { createFinding } from '../../utils/finding.js';
+import { collectParamNames } from '../../utils/param-discovery.js';
 
 /**
  * XSS Scanner — Probes all discovered input surfaces for Cross-Site Scripting.
@@ -10,7 +11,15 @@ export class XSSScanner {
     constructor(logger) {
         this.logger = logger;
         this.findings = [];
+        this._candidateParams = [];
     }
+
+    // Fallback guess-list of common reflected-input parameter names. Used to
+    // augment (never replace) parameters discovered from the actual surface.
+    static FALLBACK_PARAMS = [
+        'q', 'search', 'query', 'keyword', 's', 'term', 'name', 'id', 'page',
+        'redirect', 'url', 'return', 'next', 'callback',
+    ];
 
     // XSS test payloads — designed for detection, not exploitation
     static PAYLOADS = [
@@ -29,6 +38,19 @@ export class XSSScanner {
      * Run XSS scanning on all discovered surfaces.
      */
     async scan(surfaceInventory) {
+        // Derive real candidate parameters from forms, query strings on
+        // discovered links/pages, and API endpoint URLs — then augment with the
+        // fallback guess-list (discovered params take priority).
+        const discovered = collectParamNames(surfaceInventory);
+        this._candidateParams = [
+            ...discovered,
+            ...XSSScanner.FALLBACK_PARAMS.filter(p => !discovered.includes(p)),
+        ].slice(0, 60);
+        this.logger?.debug?.(
+            `XSS scanner: ${discovered.length} discovered params + ${XSSScanner.FALLBACK_PARAMS.length} fallback ` +
+            `→ ${this._candidateParams.length} candidates`
+        );
+
         const browser = await chromium.launch({ headless: true });
         const context = await browser.newContext({
             viewport: { width: 1440, height: 900 },
@@ -55,8 +77,10 @@ export class XSSScanner {
 
             const page = await context.newPage();
             try {
-                // Test with a canary value in common parameter names
-                const testParams = ['q', 'search', 'query', 'keyword', 's', 'term', 'name', 'id', 'page', 'redirect', 'url', 'return', 'next', 'callback'];
+                // Candidate params = discovered (forms/query/api) + fallback guesses
+                const testParams = this._candidateParams.length > 0
+                    ? this._candidateParams
+                    : XSSScanner.FALLBACK_PARAMS;
 
                 for (const param of testParams) {
                     // Use a subset of payloads for URL params

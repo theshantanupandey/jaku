@@ -1,5 +1,7 @@
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
+import { getVersion } from '../utils/version.js';
 
 /**
  * SARIF Generator — Generates Static Analysis Results Interchange Format (SARIF) v2.1.0
@@ -89,6 +91,11 @@ export function generateSARIF(findings, meta = {}) {
             rules.push(rule);
         }
 
+        // Represent the affected surface as a proper absolute web URI rather
+        // than anchoring it to the source tree (no %SRCROOT%), so GitHub does
+        // not try to map DAST URLs to repository files.
+        const webUri = _toWebUri(finding.affected_surface || meta.target);
+
         // Build result
         const result = {
             ruleId,
@@ -98,18 +105,30 @@ export function generateSARIF(findings, meta = {}) {
             locations: [{
                 physicalLocation: {
                     artifactLocation: {
-                        uri: finding.affected_surface || meta.target || 'unknown',
-                        uriBaseId: '%SRCROOT%',
+                        uri: webUri,
                     },
                 },
             }],
+            // Stable per-result fingerprint so GitHub can track findings across
+            // runs (derived from module + normalized title + affected surface).
+            partialFingerprints: {
+                'jakuFindingHash/v1': _fingerprint(finding),
+            },
             properties: {
                 severity: finding.severity,
                 module: finding.module,
                 status: finding.status || 'open',
                 timestamp: finding.timestamp || new Date().toISOString(),
+                affectedUrl: finding.affected_surface || meta.target || null,
             },
         };
+
+        // Describe the tested surface as a SARIF webRequest where we can, which
+        // signals to consumers that this is a dynamic (DAST) finding.
+        const webRequest = _toWebRequest(finding.affected_surface || meta.target);
+        if (webRequest) {
+            result.webRequest = webRequest;
+        }
 
         if (finding.remediation) {
             result.fixes = [{ description: { text: finding.remediation } }];
@@ -123,7 +142,7 @@ export function generateSARIF(findings, meta = {}) {
                         location: {
                             message: { text: typeof finding.evidence === 'string' ? finding.evidence : JSON.stringify(finding.evidence) },
                             physicalLocation: {
-                                artifactLocation: { uri: finding.affected_surface || 'unknown' },
+                                artifactLocation: { uri: webUri },
                             },
                         },
                     }],
@@ -141,8 +160,8 @@ export function generateSARIF(findings, meta = {}) {
             tool: {
                 driver: {
                     name: 'JAKU',
-                    version: meta.version || '1.0.3',
-                    semanticVersion: meta.version || '1.0.3',
+                    version: meta.version || getVersion(),
+                    semanticVersion: meta.version || getVersion(),
                     informationUri: 'https://github.com/jaku-security',
                     rules,
                 },
@@ -166,6 +185,63 @@ export function writeSARIF(findings, outputDir, meta = {}) {
     const sarifPath = path.join(outputDir, 'report.sarif');
     fs.writeFileSync(sarifPath, JSON.stringify(sarif, null, 2), 'utf-8');
     return sarifPath;
+}
+
+/**
+ * Normalize an affected surface into a clean absolute web URI.
+ * Falls back to a stable placeholder when it isn't a parseable URL.
+ */
+function _toWebUri(surface) {
+    if (!surface) return 'urn:jaku:unknown-surface';
+    try {
+        const u = new URL(surface);
+        return u.toString();
+    } catch {
+        // Not a URL (e.g. a file path or descriptive surface) — keep it as a
+        // logical identifier so GitHub doesn't treat it as a source artifact.
+        return `urn:jaku:surface:${encodeURIComponent(String(surface))}`;
+    }
+}
+
+/**
+ * Build a minimal SARIF webRequest object for a tested URL, when possible.
+ */
+function _toWebRequest(surface) {
+    if (!surface) return null;
+    try {
+        const u = new URL(surface);
+        return {
+            protocol: u.protocol.replace(':', ''),
+            target: u.toString(),
+            method: 'GET',
+        };
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Derive a stable fingerprint for cross-run finding tracking.
+ * Based on module + normalized title + affected surface (host + path only,
+ * so transient query values don't churn the hash between runs).
+ */
+function _fingerprint(finding) {
+    const module = (finding.module || 'security').toLowerCase();
+    const title = (finding.title || '')
+        .toLowerCase()
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    let surface = finding.affected_surface || '';
+    try {
+        const u = new URL(surface);
+        surface = `${u.origin}${u.pathname}`;
+    } catch {
+        // leave non-URL surfaces as-is
+    }
+
+    const basis = `${module}|${title}|${surface.toLowerCase()}`;
+    return crypto.createHash('sha256').update(basis).digest('hex');
 }
 
 /**

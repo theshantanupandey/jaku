@@ -1,4 +1,5 @@
 import { BaseAgent } from './base-agent.js';
+import { allows, getSafetyMode } from '../utils/safety.js';
 import { AuthFlowTester } from '../core/api/auth-flow-tester.js';
 import { OAuthProber } from '../core/api/oauth-prober.js';
 import { APIKeyAuditor } from '../core/api/api-key-auditor.js';
@@ -26,6 +27,14 @@ export class APIAgent extends BaseAgent {
 
         if (!surfaceInventory) {
             throw new Error('No surface inventory available — JAKU-CRAWL must run first');
+        }
+
+        // API/auth flow verification sends live requests, so it requires at
+        // least safe-active. In passive mode it is skipped.
+        if (!allows(config, 'safe-active')) {
+            this._log(`API & auth flow verification skipped — requires active probing (current: ${getSafetyMode(config)} mode)`);
+            this.progress('complete', 'API testing skipped (passive mode)', 100);
+            return;
         }
 
         // Phase 1: Auth flow testing

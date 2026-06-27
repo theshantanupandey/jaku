@@ -1,4 +1,5 @@
 import { createFinding } from '../../utils/finding.js';
+import { inferBusinessDomains } from '../llm/augmentations.js';
 
 /**
  * BusinessRuleInferrer — Infers business rules from the surface inventory.
@@ -80,7 +81,9 @@ export class BusinessRuleInferrer {
 
         const pages = surfaceInventory.pages || [];
         const forms = surfaceInventory.forms || [];
-        const apis = surfaceInventory.apis || [];
+        // The crawler emits `apiEndpoints` (not `apis`); read the correct field
+        // so business-logic API surfaces are actually categorized.
+        const apis = surfaceInventory.apiEndpoints || surfaceInventory.apis || [];
 
         // 1. Categorize pages by domain
         for (const page of pages) {
@@ -153,6 +156,52 @@ export class BusinessRuleInferrer {
         this.logger?.info?.(`  Role-gated pages: ${context.roleGatedPages.length}`);
         this.logger?.info?.(`  Pricing surfaces: ${context.pricingSurfaces.length}`);
 
+        return context;
+    }
+
+    /**
+     * Phase 3 — Augment the regex-based domain inference with LLM-inferred
+     * domains and security-relevant invariants. STRICTLY ADDITIVE: the regex
+     * DOMAIN_PATTERNS result above is untouched; results are attached under
+     * `context.llmInsights` (source:'llm'). No-op when LLM is disabled.
+     *
+     * Data minimization: only URL paths + form field NAMES are sent (no values,
+     * no bodies, no secrets).
+     */
+    async augmentWithLLM(context, surfaceInventory, llmClient) {
+        if (!llmClient?.isEnabled?.()) return context;
+
+        try {
+            const pages = surfaceInventory.pages || [];
+            const apis = surfaceInventory.apiEndpoints || surfaceInventory.apis || [];
+            const forms = surfaceInventory.forms || [];
+
+            const toPath = (u) => {
+                try { return new URL(typeof u === 'string' ? u : (u.url || '')).pathname; }
+                catch { return typeof u === 'string' ? u : (u?.url || ''); }
+            };
+
+            const paths = [...new Set([
+                ...pages.map(p => toPath(p.url || p)),
+                ...apis.map(a => toPath(a.url || a)),
+            ])].filter(Boolean);
+
+            const formFields = [...new Set(
+                forms.flatMap(f => (f.fields || []).map(fl => (fl.name || fl.id || '').toLowerCase()))
+            )].filter(Boolean);
+
+            const result = await inferBusinessDomains(llmClient, { paths, formFields });
+            if (result && (result.domains.length || result.invariants.length)) {
+                context.llmInsights = {
+                    domains: result.domains,
+                    invariants: result.invariants,
+                    source: 'llm',
+                };
+                this.logger?.info?.(`Business Rule Inferrer (LLM): +${result.domains.length} domains, ${result.invariants.length} invariants`);
+            }
+        } catch (err) {
+            this.logger?.debug?.(`Business Rule Inferrer LLM augmentation skipped: ${err.message}`);
+        }
         return context;
     }
 

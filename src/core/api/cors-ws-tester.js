@@ -54,7 +54,7 @@ export class CORSWSTester {
         const testUrls = [baseUrl + '/'];
 
         // Add API endpoints
-        const apis = surfaceInventory.apis || [];
+        const apis = surfaceInventory.apiEndpoints || surfaceInventory.apis || [];
         testUrls.push(...apis.slice(0, 5).map(a => a.url || a));
 
         // Add common API paths

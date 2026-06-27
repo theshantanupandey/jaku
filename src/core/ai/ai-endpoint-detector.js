@@ -42,18 +42,42 @@ export class AIEndpointDetector {
      */
     async detect(surfaceInventory) {
         const aiSurfaces = [];
+        const seenApiUrls = new Set();
 
-        // 1. Check discovered API endpoints
-        const apis = surfaceInventory.apis || [];
+        // 1. Check discovered API endpoints.
+        //    NOTE: the crawler emits `apiEndpoints` (not `apis`) — read the
+        //    correct field so API-discovered surfaces are actually considered.
+        const apis = surfaceInventory.apiEndpoints || surfaceInventory.apis || [];
         for (const api of apis) {
             const url = api.url || api;
-            if (this._matchesAIPattern(url)) {
+            if (!url || seenApiUrls.has(url)) continue;
+
+            const method = (api.method || 'POST').toUpperCase();
+            const contentType = api.contentType || '';
+            const matchesPattern = this._matchesAIPattern(url);
+            // Non-GET or JSON endpoints are plausible LLM surfaces even when the
+            // URL itself doesn't match a known AI path — they get probed below.
+            const isJsonOrMutating =
+                contentType.includes('application/json') ||
+                (method !== 'GET' && method !== 'OPTIONS' && method !== 'HEAD');
+
+            if (matchesPattern) {
+                seenApiUrls.add(url);
                 aiSurfaces.push({
                     type: 'api',
                     url,
-                    method: api.method || 'POST',
+                    method,
                     confidence: 'high',
                     reason: 'URL pattern matches known AI endpoint',
+                });
+            } else if (isJsonOrMutating) {
+                seenApiUrls.add(url);
+                aiSurfaces.push({
+                    type: 'api',
+                    url,
+                    method,
+                    confidence: 'low',
+                    reason: 'Non-GET/JSON API endpoint — probing for LLM behavior',
                 });
             }
         }

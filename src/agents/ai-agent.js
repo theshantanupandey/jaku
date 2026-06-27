@@ -1,4 +1,6 @@
 import { BaseAgent } from './base-agent.js';
+import { allows, getSafetyMode } from '../utils/safety.js';
+import { generateInjectionPayloads } from '../core/llm/augmentations.js';
 import { AIEndpointDetector } from '../core/ai/ai-endpoint-detector.js';
 import { PromptInjector } from '../core/ai/prompt-injector.js';
 import { JailbreakTester } from '../core/ai/jailbreak-tester.js';
@@ -32,6 +34,14 @@ export class AIAgent extends BaseAgent {
 
         if (!surfaceInventory) {
             throw new Error('No surface inventory available — JAKU-CRAWL must run first');
+        }
+
+        // AI endpoint detection and abuse testing send live requests (benign
+        // probes + injection payloads), so they require at least safe-active.
+        if (!allows(config, 'safe-active')) {
+            this._log(`AI abuse testing skipped — requires active probing (current: ${getSafetyMode(config)} mode)`);
+            this.progress('complete', 'AI testing skipped (passive mode)', 100);
+            return;
         }
 
         // Phase 1: Detect AI endpoints
@@ -78,15 +88,51 @@ export class AIAgent extends BaseAgent {
 
         // Phase 4: System Prompt Extraction
         this.progress('extraction', 'Attempting system prompt extraction...', 50);
+        let extractionFindings = [];
         try {
             const extractor = new SystemPromptExtractor(logger);
-            const extractionFindings = await extractor.extract(aiSurfaces, sendMessage);
+            extractionFindings = await extractor.extract(aiSurfaces, sendMessage);
             this.addFindings(extractionFindings);
             this._log(`System prompt extraction: ${extractionFindings.length} leaks`);
         } catch (err) {
             this._log(`System prompt extraction failed: ${err.message}`, 'error');
         }
         this.progress('extraction', 'System prompt extraction complete', 70);
+
+        // Phase 4.5: LLM-generated, context-aware injection payloads (optional).
+        // Only runs when LLM augmentation is active (egress is auto-disabled in
+        // passive mode). Generated DESTRUCTIVE payloads require --aggressive;
+        // non-destructive generated probes need safe-active (already satisfied).
+        const llmClient = context.llmClient;
+        if (llmClient?.isEnabled?.()) {
+            try {
+                // Reuse the (already-leaked) system prompt as generation context.
+                const leaked = extractionFindings
+                    .map(f => {
+                        const m = /Extracted content:\n([\s\S]*)/.exec(f.evidence || '');
+                        return m ? m[1].trim() : '';
+                    })
+                    .filter(Boolean)[0] || '';
+
+                if (leaked) {
+                    const allowDestructive = allows(config, 'aggressive');
+                    const generated = await generateInjectionPayloads(llmClient, {
+                        systemPrompt: leaked,
+                        surfaceUrl: aiSurfaces[0]?.url || config.target_url,
+                        allowDestructive,
+                    });
+                    if (generated?.length) {
+                        const genFindings = await injector.injectGenerated(aiSurfaces, generated, { allowDestructive });
+                        this.addFindings(genFindings);
+                        this._log(`LLM-generated payloads: ${genFindings.length} findings from ${generated.length} tailored payloads`);
+                    }
+                } else {
+                    this._log('No leaked system prompt — skipping LLM payload generation');
+                }
+            } catch (err) {
+                this._log(`LLM payload generation failed: ${err.message}`, 'error');
+            }
+        }
 
         // Phase 5: Output Analysis (AI-mediated XSS)
         this.progress('output', 'Analyzing AI output sanitization...', 70);

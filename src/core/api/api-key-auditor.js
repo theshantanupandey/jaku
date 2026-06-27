@@ -63,7 +63,7 @@ export class APIKeyAuditor {
     _checkKeysInURLs(surfaceInventory) {
         const findings = [];
         const pages = surfaceInventory.pages || [];
-        const apis = surfaceInventory.apis || [];
+        const apis = surfaceInventory.apiEndpoints || surfaceInventory.apis || [];
 
         for (const entry of [...pages, ...apis]) {
             const url = entry.url || entry;

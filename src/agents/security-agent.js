@@ -1,4 +1,5 @@
 import { BaseAgent } from './base-agent.js';
+import { allows, getSafetyMode } from '../utils/safety.js';
 import { HeaderAnalyzer } from '../core/security/header-analyzer.js';
 import { SecretDetector } from '../core/security/secret-detector.js';
 import { XSSScanner } from '../core/security/xss-scanner.js';
@@ -36,6 +37,13 @@ export class SecurityAgent extends BaseAgent {
         if (!surfaceInventory) {
             throw new Error('No surface inventory available — JAKU-CRAWL must run first');
         }
+
+        // Active attack probing (injecting payloads) requires at least
+        // safe-active. In passive mode we only run read-only/analysis checks.
+        const allowActive = allows(config, 'safe-active');
+        const safetyMode = getSafetyMode(config);
+        const skipActive = (label) =>
+            this._log(`${label} skipped — requires active probing (current: ${safetyMode} mode)`);
 
         const phases = [
             { name: 'headers', label: 'Analyzing security headers' },
@@ -82,27 +90,35 @@ export class SecurityAgent extends BaseAgent {
         }
         completedPhases++;
 
-        // Phase 3: XSS Scanning
-        this.progress(phases[2].name, phases[2].label, (completedPhases / phases.length) * 100);
-        try {
-            const scanner = new XSSScanner(logger);
-            const findings = await scanner.scan(surfaceInventory);
-            this.addFindings(findings);
-            this._log(`XSS: ${findings.length} vulnerabilities`);
-        } catch (err) {
-            this._log(`XSS scanning failed: ${err.message}`, 'error');
+        // Phase 3: XSS Scanning (active probing)
+        if (allowActive) {
+            this.progress(phases[2].name, phases[2].label, (completedPhases / phases.length) * 100);
+            try {
+                const scanner = new XSSScanner(logger);
+                const findings = await scanner.scan(surfaceInventory);
+                this.addFindings(findings);
+                this._log(`XSS: ${findings.length} vulnerabilities`);
+            } catch (err) {
+                this._log(`XSS scanning failed: ${err.message}`, 'error');
+            }
+        } else {
+            skipActive('XSS scanning');
         }
         completedPhases++;
 
-        // Phase 4: SQL Injection Probing
-        this.progress(phases[3].name, phases[3].label, (completedPhases / phases.length) * 100);
-        try {
-            const prober = new SQLiProber(logger);
-            const findings = await prober.probe(surfaceInventory);
-            this.addFindings(findings);
-            this._log(`SQLi: ${findings.length} vulnerabilities`);
-        } catch (err) {
-            this._log(`SQLi probing failed: ${err.message}`, 'error');
+        // Phase 4: SQL Injection Probing (active probing)
+        if (allowActive) {
+            this.progress(phases[3].name, phases[3].label, (completedPhases / phases.length) * 100);
+            try {
+                const prober = new SQLiProber(logger);
+                const findings = await prober.probe(surfaceInventory);
+                this.addFindings(findings);
+                this._log(`SQLi: ${findings.length} vulnerabilities`);
+            } catch (err) {
+                this._log(`SQLi probing failed: ${err.message}`, 'error');
+            }
+        } else {
+            skipActive('SQLi probing');
         }
         completedPhases++;
 
@@ -130,27 +146,35 @@ export class SecurityAgent extends BaseAgent {
         }
         completedPhases++;
 
-        // Phase 7: Infrastructure Scan
-        this.progress(phases[6].name, phases[6].label, (completedPhases / phases.length) * 100);
-        try {
-            const scanner = new InfraScanner(logger);
-            const findings = await scanner.scan(surfaceInventory);
-            this.addFindings(findings);
-            this._log(`Infrastructure: ${findings.length} issues`);
-        } catch (err) {
-            this._log(`Infrastructure scan failed: ${err.message}`, 'error');
+        // Phase 7: Infrastructure Scan (active probing of admin/debug endpoints)
+        if (allowActive) {
+            this.progress(phases[6].name, phases[6].label, (completedPhases / phases.length) * 100);
+            try {
+                const scanner = new InfraScanner(logger);
+                const findings = await scanner.scan(surfaceInventory);
+                this.addFindings(findings);
+                this._log(`Infrastructure: ${findings.length} issues`);
+            } catch (err) {
+                this._log(`Infrastructure scan failed: ${err.message}`, 'error');
+            }
+        } else {
+            skipActive('Infrastructure scan');
         }
         completedPhases++;
 
-        // Phase 8: File Upload Testing
-        this.progress(phases[7].name, phases[7].label, (completedPhases / phases.length) * 100);
-        try {
-            const uploader = new FileUploadTester(logger);
-            const findings = await uploader.test(surfaceInventory);
-            this.addFindings(findings);
-            this._log(`File uploads: ${findings.length} issues`);
-        } catch (err) {
-            this._log(`File upload testing failed: ${err.message}`, 'error');
+        // Phase 8: File Upload Testing (active probing)
+        if (allowActive) {
+            this.progress(phases[7].name, phases[7].label, (completedPhases / phases.length) * 100);
+            try {
+                const uploader = new FileUploadTester(logger);
+                const findings = await uploader.test(surfaceInventory);
+                this.addFindings(findings);
+                this._log(`File uploads: ${findings.length} issues`);
+            } catch (err) {
+                this._log(`File upload testing failed: ${err.message}`, 'error');
+            }
+        } else {
+            skipActive('File upload testing');
         }
         completedPhases++;
 
@@ -166,15 +190,19 @@ export class SecurityAgent extends BaseAgent {
         }
         completedPhases++;
 
-        // Phase 10: Open Redirect Detection
-        this.progress(phases[9].name, phases[9].label, (completedPhases / phases.length) * 100);
-        try {
-            const detector = new OpenRedirectDetector(logger);
-            const findings = await detector.detect(surfaceInventory);
-            this.addFindings(findings);
-            this._log(`Open redirects: ${findings.length} issues`);
-        } catch (err) {
-            this._log(`Open redirect detection failed: ${err.message}`, 'error');
+        // Phase 10: Open Redirect Detection (active probing)
+        if (allowActive) {
+            this.progress(phases[9].name, phases[9].label, (completedPhases / phases.length) * 100);
+            try {
+                const detector = new OpenRedirectDetector(logger);
+                const findings = await detector.detect(surfaceInventory);
+                this.addFindings(findings);
+                this._log(`Open redirects: ${findings.length} issues`);
+            } catch (err) {
+                this._log(`Open redirect detection failed: ${err.message}`, 'error');
+            }
+        } else {
+            skipActive('Open redirect detection');
         }
         completedPhases++;
 
@@ -226,15 +254,19 @@ export class SecurityAgent extends BaseAgent {
         }
         completedPhases++;
 
-        // Phase 15: SSRF Probing
-        this.progress(phases[14].name, phases[14].label, (completedPhases / phases.length) * 100);
-        try {
-            const prober = new SSRFProber(logger);
-            const findings = await prober.probe(surfaceInventory);
-            this.addFindings(findings);
-            this._log(`SSRF: ${findings.length} issues`);
-        } catch (err) {
-            this._log(`SSRF probing failed: ${err.message}`, 'error');
+        // Phase 15: SSRF Probing (active probing)
+        if (allowActive) {
+            this.progress(phases[14].name, phases[14].label, (completedPhases / phases.length) * 100);
+            try {
+                const prober = new SSRFProber(logger);
+                const findings = await prober.probe(surfaceInventory);
+                this.addFindings(findings);
+                this._log(`SSRF: ${findings.length} issues`);
+            } catch (err) {
+                this._log(`SSRF probing failed: ${err.message}`, 'error');
+            }
+        } else {
+            skipActive('SSRF probing');
         }
         completedPhases++;
 

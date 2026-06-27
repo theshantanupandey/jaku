@@ -18,6 +18,7 @@ export function createFinding({
     remediation = '',
     references = [],
     status = 'open',
+    source = null,
 }) {
     const prefix = module.toUpperCase();
     const shortId = nanoid(6);
@@ -35,6 +36,8 @@ export function createFinding({
         references,
         status,
         timestamp: new Date().toISOString(),
+        // Provenance: 'llm' marks AI-generated/augmented findings; null = deterministic.
+        ...(source ? { source } : {}),
     };
 
     // Auto-tag with OWASP Top 10 classification
