@@ -97,6 +97,17 @@ npm install -D jaku.sh@latest
 # - uses: theshantanupandey/jaku@v1.2.0
 ```
 
+### What's new in v1.2.1
+
+- **Resilient install.** The Chromium download no longer blocks or breaks
+  `npm install` — it is non-fatal, interrupt-safe (a Ctrl+C won't fail the
+  install), and skippable with `JAKU_SKIP_BROWSER_DOWNLOAD=1`.
+- **Auto browser setup on first scan.** If Chromium is missing when you run a
+  scan, JAKU installs it automatically (one-time) instead of erroring out.
+
+> Updating? If a previous Chromium download was interrupted, just run a scan —
+> JAKU will finish setting up the browser — or run `npx playwright install chromium`.
+
 ### What's new in v1.2.0
 
 > ⚠ **Behavior change for existing users:** destructive business-logic tests

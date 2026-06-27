@@ -16,6 +16,7 @@ import { ComplianceReporter } from './reporting/compliance-reporter.js';
 import { AuthManager } from './core/auth-manager.js';
 import { getVersion } from './utils/version.js';
 import { LLMClient } from './core/llm/llm-client.js';
+import { ensureChromium } from './utils/browser.js';
 
 const VERSION = getVersion();
 
@@ -115,6 +116,16 @@ async function runScan(url, options, modulesToRun) {
         (llmActive ? chalk.cyan(llmStatus) : chalk.dim(llmStatus))
     );
     console.log();
+
+    // ═══════════════════════════════════════
+    // Preflight: ensure the browser engine is available
+    // ═══════════════════════════════════════
+    try {
+        ensureChromium(logger);
+    } catch (err) {
+        console.error(chalk.red(`\n  ⛔ ${err.message}\n`));
+        process.exit(1);
+    }
 
     // ═══════════════════════════════════════
     // Phase 0: Authentication (before spinners)
