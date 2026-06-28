@@ -9,13 +9,48 @@
  *     CLI installed and exits 0 instead of failing the whole install. JAKU will
  *     auto-install the browser on first scan if it is still missing.
  */
+import fs from 'node:fs';
+import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
 
 function log(msg) {
     process.stdout.write(`${msg}\n`);
 }
 
 const MANUAL = 'Run `npx playwright install chromium` before your first scan.';
+
+/** Prefer the Playwright CLI bundled with our dependency over an npx fetch. */
+function resolvePlaywrightCli() {
+    for (const spec of ['playwright', 'playwright-core']) {
+        try {
+            const pkgPath = require.resolve(`${spec}/package.json`);
+            const bin = JSON.parse(fs.readFileSync(pkgPath, 'utf8')).bin;
+            const rel = typeof bin === 'string' ? bin : bin && Object.values(bin)[0];
+            if (!rel) continue;
+            const cli = path.join(path.dirname(pkgPath), rel);
+            if (fs.existsSync(cli)) return cli;
+        } catch {
+            // try the next candidate
+        }
+    }
+    return null;
+}
+
+function installChromium() {
+    const cli = resolvePlaywrightCli();
+    if (cli) {
+        return spawnSync(process.execPath, [cli, 'install', 'chromium'], {
+            stdio: 'inherit',
+        });
+    }
+    return spawnSync('npx', ['playwright', 'install', 'chromium'], {
+        stdio: 'inherit',
+        shell: process.platform === 'win32',
+    });
+}
 
 // If interrupted directly, don't fail the install.
 process.on('SIGINT', () => {
@@ -34,14 +69,12 @@ function main() {
     }
 
     log('JAKU: Installing Chromium for Playwright (~170 MB, one-time).');
+    log('      After the download reaches 100% it extracts silently (no progress bar) for ~1 min.');
     log('      Set JAKU_SKIP_BROWSER_DOWNLOAD=1 to skip; JAKU also auto-installs it on first scan.');
 
     let res;
     try {
-        res = spawnSync('npx', ['playwright', 'install', 'chromium'], {
-            stdio: 'inherit',
-            shell: process.platform === 'win32',
-        });
+        res = installChromium();
     } catch (e) {
         log(`⚠ JAKU: Could not auto-install Chromium (${e.message}). ${MANUAL}`);
         return 0;

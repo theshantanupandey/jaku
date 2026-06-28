@@ -97,6 +97,16 @@ npm install -D jaku.sh@latest
 # - uses: theshantanupandey/jaku@v1.2.0
 ```
 
+### What's new in v1.2.2
+
+- **Clearer first-run browser setup.** When JAKU installs Chromium on first
+  scan it now explains that the post-download **extraction step is silent and
+  takes ~1 minute** (so it no longer looks frozen), and prints `✔ Chromium ready`
+  when done. Interrupted/partial downloads are repaired automatically.
+- **More reliable installer.** JAKU now runs the Playwright CLI it ships with
+  directly instead of via `npx`, avoiding a separate fetch when installed
+  globally.
+
 ### What's new in v1.2.1
 
 - **Resilient install.** The Chromium download no longer blocks or breaks

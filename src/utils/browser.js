@@ -1,6 +1,10 @@
 import fs from 'fs';
+import path from 'path';
 import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { chromium } from 'playwright';
+
+const require = createRequire(import.meta.url);
 
 /**
  * Returns the path to the Chromium build Playwright expects, or null if it
@@ -22,8 +26,44 @@ export function isChromiumInstalled() {
 }
 
 /**
- * Ensure Chromium is available before a scan. If it is missing, attempt a
- * one-time install (unless skipping is requested), then re-check.
+ * Resolve the Playwright CLI that ships with our own dependency. Running it via
+ * `node <cli> install chromium` (instead of `npx playwright ...`) guarantees we
+ * use the installed Playwright version and never trigger npx to fetch a
+ * separate copy — which matters most when JAKU is installed globally.
+ */
+function resolvePlaywrightCli() {
+    for (const spec of ['playwright', 'playwright-core']) {
+        try {
+            const pkgPath = require.resolve(`${spec}/package.json`);
+            const bin = JSON.parse(fs.readFileSync(pkgPath, 'utf8')).bin;
+            const rel = typeof bin === 'string' ? bin : bin && Object.values(bin)[0];
+            if (!rel) continue;
+            const cli = path.join(path.dirname(pkgPath), rel);
+            if (fs.existsSync(cli)) return cli;
+        } catch {
+            // try the next candidate
+        }
+    }
+    return null;
+}
+
+function runChromiumInstall() {
+    const cli = resolvePlaywrightCli();
+    if (cli) {
+        return spawnSync(process.execPath, [cli, 'install', 'chromium'], { stdio: 'inherit' });
+    }
+    // Last resort if resolution fails for some reason.
+    return spawnSync('npx', ['playwright', 'install', 'chromium'], {
+        stdio: 'inherit',
+        shell: process.platform === 'win32',
+    });
+}
+
+/**
+ * Ensure Chromium is available before a scan. If it is missing (or a previous
+ * download was interrupted/left partial), install it once — with clear
+ * messaging so the silent extraction step doesn't look like a hang — then
+ * re-check.
  *
  * Throws a friendly Error if Chromium is required but unavailable so the CLI
  * can print actionable guidance instead of a raw Playwright stack trace.
@@ -40,23 +80,19 @@ export function ensureChromium(logger) {
         );
     }
 
-    const msg = 'Chromium not found — installing it now (one-time, ~170 MB). This may take a minute...';
-    logger?.info?.(msg);
-    console.log(`  ${msg}`);
+    logger?.info?.('Chromium not found — installing Playwright Chromium (one-time).');
+    console.log('  Chromium not found — setting it up now (one-time).');
+    console.log('  Downloading + extracting (~170 MB). The extraction step shows no progress');
+    console.log('  bar and can take a minute — please wait, do not interrupt...');
 
-    try {
-        spawnSync('npx', ['playwright', 'install', 'chromium'], {
-            stdio: 'inherit',
-            shell: process.platform === 'win32',
-        });
-    } catch {
-        // fall through to the re-check below
-    }
+    runChromiumInstall();
 
     if (!isChromiumInstalled()) {
         throw new Error(
             'Chromium is required but could not be installed automatically. Run: npx playwright install chromium'
         );
     }
+
+    console.log('  \u2714 Chromium ready.\n');
     return true;
 }
